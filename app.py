@@ -84,32 +84,37 @@ def load_all_data():
         return df
     except Exception: return pd.DataFrame()
 
-# --- HELPER: CONTEXT GENERATOR ---
+# --- HELPER: CONTEXT GENERATOR (ALL YEARS) ---
 def get_dataset_context(df):
-    """Summarizes data (Price, Volume, Seasonality) for the AI."""
+    """Summarizes data (Price, Volume, Seasonality, History) for the AI."""
     # 1. Setup Data
     df_context = df.copy()
     df_context['year'] = df_context['month'].dt.year
     latest_year = df_context['year'].max()
     
-    # 2. Price Map (Recent)
+    # 2. Latest Prices (Crucial for "Current" Value)
     recent_df = df_context[df_context['year'] == latest_year]
-    price_map = recent_df.groupby(['town', 'flat_type'])['resale_price'].mean().to_dict()
+    current_price_map = recent_df.groupby(['town', 'flat_type'])['resale_price'].mean().to_dict()
     
-    # 3. Yearly Trends (Price AND Volume)
+    # 3. Global Trends
     yearly_price = df_context.groupby('year')['resale_price'].mean().to_dict()
     yearly_vol = df_context.groupby('year')['resale_price'].count().to_dict()
     
-    # 4. Seasonality (Average Volume per Month Name)
+    # 4. Seasonality (Avg Volume/Month)
     df_context['month_name'] = df_context['month'].dt.month_name()
     total_years = df_context['year'].nunique()
     seasonality = (df_context.groupby('month_name').size() / total_years).astype(int).to_dict()
     
+    # 5. Full Historical Context
+    # Allows AI to compare specific years (e.g. Bedok 2019 vs 2024)
+    historical_map = df_context.groupby(['year', 'town', 'flat_type'])['resale_price'].mean().to_dict()
+    
     return f"""
-    [Current Year ({latest_year}) Prices]: {price_map}
-    [Yearly Avg Price]: {yearly_price}
+    [Current Year ({latest_year}) Prices]: {current_price_map}
+    [Yearly Avg Price (Global)]: {yearly_price}
     [Yearly Total Volume]: {yearly_vol}
-    [Average Transactions Per Month (Seasonality)]: {seasonality}
+    [Seasonality (Avg Volume/Month)]: {seasonality}
+    [Historical Price Lookup (Year, Town, Type)]: {historical_map}
     """
 
 # --- AI ENGINE ---
@@ -132,8 +137,8 @@ def ask_ai(question, df):
     
     STRICT RULES:
     1. **FUTURE PREDICTIONS** (e.g. "Price in 2026?"): Do NOT write code. Write TEXT estimate based on trend.
-    2. **ADVICE/ANALYSIS** (e.g. "Lowest month on average?", "Should I sell?"): 
-       - Look at the [Seasonality] or [Yearly Trends] data above.
+    2. **ADVICE/ANALYSIS** (e.g. "Lowest month on average?", "Compare 2019 vs 2024"): 
+       - Look at the [Seasonality], [Yearly Trends], or [Historical Price Lookup] data above.
        - Write a TEXT response explaining the data.
     3. **CALCULATIONS** (e.g. "Most expensive town?", "Average price?"): 
        - Write Python code wrapped in ```python ... ```.
@@ -272,10 +277,9 @@ if not df.empty:
 
     st.divider()
 
-    # --- AI CHATBOT (UPDATED WITH EXAMPLES) ---
+    # --- AI CHATBOT (UPDATED) ---
     st.subheader("🤖 AI Consultant")
     
-    # Suggestion Chips / Text
     st.markdown("""
     **Try asking questions like:**
     * 💰 *'What is the average price of a 4-room flat in Bedok?'*
