@@ -19,8 +19,12 @@ except FileNotFoundError:
     api_key = None
 
 # --- CONFIGURATION ---
+# Note: Using the RAW version of your GitHub URL
+GITHUB_CSV_URL = "https://raw.githubusercontent.com/foosy-git/hdb-dashboard/main/2017-2025.csv"
 RESOURCE_ID = "d_8b84c4ee58e3cfc0ece0d773c8ca6abc"
-CACHE_FILE = "hdb_full_data_cache.csv"
+CACHE_FILE = "hdb_combined_cache.csv"
+
+# Coordinates for Map
 TOWN_COORDS = {
     "ANG MO KIO": {"lat": 1.3691, "lon": 103.8454},
     "BEDOK": {"lat": 1.3236, "lon": 103.9273},
@@ -51,74 +55,106 @@ TOWN_COORDS = {
     "YISHUN": {"lat": 1.4304, "lon": 103.8354}
 }
 
-# --- SAFE DATA LOADER ---
+# --- HYBRID DATA LOADER (GitHub + API) ---
 @st.cache_data(ttl=3600)
 def load_all_data():
-    df = pd.DataFrame()
-    
-    # 1. Try Loading from Cache
-    if os.path.exists(CACHE_FILE):
-        try:
-            df = pd.read_csv(CACHE_FILE)
-        except:
-            pass 
+    df_combined = pd.DataFrame()
+    status_text = st.empty()
 
-    # 2. If Cache Empty, Download from API
-    if df.empty:
-        base_url = "https://data.gov.sg/api/action/datastore_search"
-        all_records = []
-        offset = 0
-        limit = 10000 
+    # 1. Load Historical Data from GitHub (CSV)
+    try:
+        # Load from the RAW GitHub URL
+        df_csv = pd.read_csv(GITHUB_CSV_URL)
         
-        status_text = st.empty()
-        progress_bar = st.progress(0)
-        
-        try:
-            while True:
-                # 60 Second Timeout for slow connections
-                params = {"resource_id": RESOURCE_ID, "limit": limit, "offset": offset, "sort": "month desc"}
-                r = requests.get(base_url, params=params, timeout=60) 
-                data = r.json()
-                
-                if not data.get('success') or not data['result']['records']: break
-                
-                new_records = data['result']['records']
-                all_records.extend(new_records)
-                
-                status_text.text(f"⏳ Downloading HDB Data... {len(all_records):,} rows collected")
-                
-                if len(new_records) < limit: break
-                offset += limit
-                if len(all_records) > 300000: break
-
-            progress_bar.empty()
-            status_text.empty()
+        # Clean CSV Columns immediately to match API format
+        df_csv.columns = df_csv.columns.str.strip().str.lower().str.replace(' ', '_')
+        if 'month' in df_csv.columns:
+            df_csv['month'] = pd.to_datetime(df_csv['month'])
             
-            df = pd.DataFrame(all_records)
-            df.to_csv(CACHE_FILE, index=False)
-
-        except Exception as e:
-            st.error(f"Data Download Failed: {e}")
-            return pd.DataFrame()
-
-    # --- DATA CLEANING & CALCULATION (Runs on cached or new data) ---
-    if not df.empty:
-        # Standardize columns
-        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
-
-        if 'month' in df.columns: df['month'] = pd.to_datetime(df['month'])
+        # status_text.text(f"✅ Loaded {len(df_csv):,} rows from GitHub history.")
         
+    except Exception as e:
+        st.error(f"Failed to load historical data from GitHub: {e}")
+        df_csv = pd.DataFrame()
+
+    # 2. Fetch NEW Data from API (Data AFTER 2025-12)
+    # Logic: We fetch from API sorted by date. We stop when we hit 2025-12 or earlier.
+    api_records = []
+    base_url = "https://data.gov.sg/api/action/datastore_search"
+    offset = 0
+    limit = 5000
+    cutoff_date = pd.Timestamp("2025-12-31") # We only want data strictly AFTER Dec 2025
+
+    try:
+        while True:
+            params = {
+                "resource_id": RESOURCE_ID, 
+                "limit": limit, 
+                "offset": offset, 
+                "sort": "month desc" # Get newest first
+            }
+            r = requests.get(base_url, params=params, timeout=10)
+            data = r.json()
+            
+            if not data.get('success') or not data['result']['records']: 
+                break
+            
+            batch = data['result']['records']
+            
+            # Convert batch to DataFrame to check dates
+            df_batch = pd.DataFrame(batch)
+            if 'month' in df_batch.columns:
+                df_batch['month'] = pd.to_datetime(df_batch['month'])
+            
+            # Filter: Keep only rows > 2025-12
+            new_data = df_batch[df_batch['month'] > cutoff_date]
+            
+            if not new_data.empty:
+                api_records.extend(new_data.to_dict('records'))
+                status_text.text(f"⏳ Found {len(api_records)} new records from API...")
+            
+            # If the batch contained ANY data <= cutoff, we have reached the overlap point. Stop.
+            if (df_batch['month'] <= cutoff_date).any():
+                break
+                
+            # Safety break if API is empty or we fetched too much
+            if len(batch) < limit: 
+                break
+            offset += limit
+
+    except Exception as e:
+        st.warning(f"API check failed (using CSV only): {e}")
+
+    # 3. Combine Data
+    df_api = pd.DataFrame(api_records)
+    
+    # Ensure API columns are cleaned
+    if not df_api.empty:
+        df_api.columns = df_api.columns.str.strip().str.lower().str.replace(' ', '_')
+        if 'month' in df_api.columns:
+            df_api['month'] = pd.to_datetime(df_api['month'])
+            
+    # Concatenate CSV + API
+    df_combined = pd.concat([df_api, df_csv], ignore_index=True)
+    
+    # Remove duplicates just in case
+    df_combined.drop_duplicates(subset=['month', 'town', 'block', 'street_name', 'resale_price'], inplace=True)
+
+    status_text.empty()
+
+    # --- FINAL PROCESSING (Types & Metrics) ---
+    if not df_combined.empty:
         # Numeric conversions
         cols_to_numeric = ['resale_price', 'floor_area_sqm', 'lease_commence_date']
         for c in cols_to_numeric:
-            if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
+            if c in df_combined.columns: 
+                df_combined[c] = pd.to_numeric(df_combined[c], errors='coerce')
 
-        # [REQUEST 1 & 4 FIX]: Force Calculation of Price Per Sqm
-        # We do this here to ensure it exists even if the cached CSV didn't have it
-        if 'resale_price' in df.columns and 'floor_area_sqm' in df.columns:
-            df['price_per_sqm'] = df['resale_price'] / df['floor_area_sqm']
+        # Calculate Price Per Sqm (for both CSV and API rows)
+        if 'resale_price' in df_combined.columns and 'floor_area_sqm' in df_combined.columns:
+            df_combined['price_per_sqm'] = df_combined['resale_price'] / df_combined['floor_area_sqm']
             
-    return df
+    return df_combined
 
 # --- HELPER: CONTEXT GENERATOR ---
 def get_dataset_context(df):
@@ -226,7 +262,9 @@ def ask_ai(question, df):
 # --- MAIN APP UI ---
 st.title("🇸🇬 HDB Resale Prices Analyst")
 
+# Load Data (Hybrid: GitHub CSV + API updates)
 df = load_all_data()
+
 if not df.empty and 'month' in df.columns:
     df['month'] = pd.to_datetime(df['month'])
 
@@ -263,7 +301,7 @@ if not df.empty:
     # --- VISUAL DASHBOARD ---
     st.subheader("📊 Visual Explorer")
     
-    # [REQUEST 3 & 4]: 4 Columns including Max Price and Price/Sqm
+    # Metrics
     c1, c2, c3, c4 = st.columns(4)
     if not filt_df.empty:
         c1.metric("Volume", f"{len(filt_df):,}")
@@ -277,7 +315,7 @@ if not df.empty:
     
     st.divider()
     
-    # [REQUEST 2]: New Trend Graphs with Tabs
+    # Trend Graphs
     st.markdown("#### 📈 Market Trends")
     tab1, tab2 = st.tabs(["💰 Total Price Trend", "📏 Price per Sqm Trend"])
     
@@ -318,7 +356,7 @@ if not df.empty:
 
     st.divider()
     
-    # --- [REQUEST 1]: Detailed Data with New Column ---
+    # --- Detailed Data ---
     st.markdown("#### 📋 Detailed Data")
     
     search_query = st.text_input("🔍 Search by Street Name or Block", "")
@@ -336,7 +374,6 @@ if not df.empty:
             "month": st.column_config.DateColumn("Month"),
             "resale_price": st.column_config.NumberColumn("Price", format="$%d"),
             "floor_area_sqm": st.column_config.NumberColumn("Size (sqm)"),
-            # NEW COLUMN CONFIG
             "price_per_sqm": st.column_config.NumberColumn("Price/Sqm", format="$%d")
         },
         height=400
