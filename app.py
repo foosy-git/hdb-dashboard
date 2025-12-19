@@ -54,43 +54,55 @@ TOWN_COORDS = {
 # --- SAFE DATA LOADER ---
 @st.cache_data(ttl=3600)
 def load_all_data():
+    df = pd.DataFrame()
+    
+    # 1. Try Loading from Cache
     if os.path.exists(CACHE_FILE):
         try:
-            return pd.read_csv(CACHE_FILE)
+            df = pd.read_csv(CACHE_FILE)
         except:
             pass 
 
-    base_url = "https://data.gov.sg/api/action/datastore_search"
-    all_records = []
-    offset = 0
-    limit = 10000 
-    
-    status_text = st.empty()
-    progress_bar = st.progress(0)
-    
-    try:
-        while True:
-            # 60 Second Timeout for slow connections
-            params = {"resource_id": RESOURCE_ID, "limit": limit, "offset": offset, "sort": "month desc"}
-            r = requests.get(base_url, params=params, timeout=60) 
-            data = r.json()
-            
-            if not data.get('success') or not data['result']['records']: break
-            
-            new_records = data['result']['records']
-            all_records.extend(new_records)
-            
-            status_text.text(f"⏳ Downloading HDB Data... {len(all_records):,} rows collected")
-            
-            if len(new_records) < limit: break
-            offset += limit
-            if len(all_records) > 300000: break
+    # 2. If Cache Empty, Download from API
+    if df.empty:
+        base_url = "https://data.gov.sg/api/action/datastore_search"
+        all_records = []
+        offset = 0
+        limit = 10000 
+        
+        status_text = st.empty()
+        progress_bar = st.progress(0)
+        
+        try:
+            while True:
+                # 60 Second Timeout for slow connections
+                params = {"resource_id": RESOURCE_ID, "limit": limit, "offset": offset, "sort": "month desc"}
+                r = requests.get(base_url, params=params, timeout=60) 
+                data = r.json()
+                
+                if not data.get('success') or not data['result']['records']: break
+                
+                new_records = data['result']['records']
+                all_records.extend(new_records)
+                
+                status_text.text(f"⏳ Downloading HDB Data... {len(all_records):,} rows collected")
+                
+                if len(new_records) < limit: break
+                offset += limit
+                if len(all_records) > 300000: break
 
-        progress_bar.empty()
-        status_text.empty()
-        
-        df = pd.DataFrame(all_records)
-        
+            progress_bar.empty()
+            status_text.empty()
+            
+            df = pd.DataFrame(all_records)
+            df.to_csv(CACHE_FILE, index=False)
+
+        except Exception as e:
+            st.error(f"Data Download Failed: {e}")
+            return pd.DataFrame()
+
+    # --- DATA CLEANING & CALCULATION (Runs on cached or new data) ---
+    if not df.empty:
         # Standardize columns
         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
@@ -101,18 +113,14 @@ def load_all_data():
         for c in cols_to_numeric:
             if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
 
-        # --- NEW: Calculate Price Per Sqm ---
+        # [REQUEST 1 & 4 FIX]: Force Calculation of Price Per Sqm
+        # We do this here to ensure it exists even if the cached CSV didn't have it
         if 'resale_price' in df.columns and 'floor_area_sqm' in df.columns:
             df['price_per_sqm'] = df['resale_price'] / df['floor_area_sqm']
             
-        df.to_csv(CACHE_FILE, index=False)
-        return df
+    return df
 
-    except Exception as e:
-        st.error(f"Data Download Failed: {e}")
-        return pd.DataFrame()
-
-# --- HELPER: CONTEXT GENERATOR (UPDATED WITH BLOCK ANALYSIS) ---
+# --- HELPER: CONTEXT GENERATOR ---
 def get_dataset_context(df):
     """Summarizes data (Price, Volume, Seasonality, Block Highlights) for the AI."""
     df_context = df.copy()
@@ -123,7 +131,6 @@ def get_dataset_context(df):
     recent_df = df_context[df_context['year'] == latest_year]
     current_price_map = recent_df.groupby(['town', 'flat_type'])['resale_price'].mean().to_dict()
     yearly_price = df_context.groupby('year')['resale_price'].mean().to_dict()
-    yearly_vol = df_context.groupby('year')['resale_price'].count().to_dict()
     
     df_context['month_name'] = df_context['month'].dt.month_name()
     total_years = df_context['year'].nunique()
@@ -132,14 +139,11 @@ def get_dataset_context(df):
     # 2. Historical Town/Type Map
     historical_map = df_context.groupby(['year', 'town', 'flat_type'])['resale_price'].mean().to_dict()
     
-    # 3. NEW: Block Highlights (Top 1 Most Expensive Block per Town)
-    # We aggregate by block to find the "Premium Blocks" in each area
+    # 3. Block Highlights
     if 'block' in df_context.columns:
         block_df = df_context.groupby(['town', 'block'])['resale_price'].mean().reset_index()
-        # Sort by Town (Asc) and Price (Desc)
         top_blocks = block_df.sort_values(['town', 'resale_price'], ascending=[True, False]).drop_duplicates('town')
         
-        # Create a readable string map: {'ANG MO KIO': 'Block 310A ($1,200,000)', ...}
         top_block_map = {
             row['town']: f"Block {row['block']} (Avg ${row['resale_price']:,.0f})"
             for _, row in top_blocks.iterrows()
@@ -183,7 +187,7 @@ def ask_ai(question, df):
     
     3. **CALCULATIONS** (e.g. "Average price of Block 123?", "Count transactions in 2024?"): 
        - You MUST write Python code using the dataframe `df`.
-       - The dataframe contains columns: `town`, `block`, `street_name`, `flat_type`, `resale_price`, `month`.
+       - The dataframe contains columns: `town`, `block`, `street_name`, `flat_type`, `resale_price`, `month`, `price_per_sqm`.
        - **CRITICAL:** Do NOT try to use variables like `top_block_map` in your Python code. Query `df` directly.
        - Example:
          ```python
@@ -258,27 +262,46 @@ if not df.empty:
 
     # --- VISUAL DASHBOARD ---
     st.subheader("📊 Visual Explorer")
-    c1, c2, c3 = st.columns(3)
+    
+    # [REQUEST 3 & 4]: 4 Columns including Max Price and Price/Sqm
+    c1, c2, c3, c4 = st.columns(4)
     if not filt_df.empty:
         c1.metric("Volume", f"{len(filt_df):,}")
         c2.metric("Avg Price", f"${filt_df['resale_price'].mean():,.0f}")
+        c3.metric("Max Price", f"${filt_df['resale_price'].max():,.0f}")
         
-        # --- FIXED METRIC: Price Per Sqm ---
         if 'price_per_sqm' in filt_df.columns:
-            c3.metric("Avg Price/Sqm", f"${filt_df['price_per_sqm'].mean():,.0f}")
+            c4.metric("Avg Price/Sqm", f"${filt_df['price_per_sqm'].mean():,.0f}")
         else:
-            c3.metric("Avg Price/Sqm", "N/A")
+            c4.metric("Avg Price/Sqm", "N/A")
     
     st.divider()
-    st.markdown("#### 📈 Price Trends")
+    
+    # [REQUEST 2]: New Trend Graphs with Tabs
+    st.markdown("#### 📈 Market Trends")
+    tab1, tab2 = st.tabs(["💰 Total Price Trend", "📏 Price per Sqm Trend"])
+    
     if not filt_df.empty:
-        trend_data = filt_df.groupby(['month', 'town'])['resale_price'].mean().reset_index().sort_values('month')
-        fig = px.line(trend_data, x='month', y='resale_price', color='town')
-        st.plotly_chart(fig, use_container_width=True)
+        # Tab 1: Total Price
+        with tab1:
+            trend_data = filt_df.groupby(['month', 'town'])['resale_price'].mean().reset_index().sort_values('month')
+            fig_price = px.line(trend_data, x='month', y='resale_price', color='town', title="Average Resale Price Over Time")
+            st.plotly_chart(fig_price, use_container_width=True)
+            
+        # Tab 2: Price Per Sqm
+        with tab2:
+            if 'price_per_sqm' in filt_df.columns:
+                psm_trend = filt_df.groupby(['month', 'town'])['price_per_sqm'].mean().reset_index().sort_values('month')
+                fig_psm = px.line(psm_trend, x='month', y='price_per_sqm', color='town', title="Average Price Per Sqm Over Time")
+                st.plotly_chart(fig_psm, use_container_width=True)
+            else:
+                st.warning("Price per Sqm data not available for plotting.")
     else:
         st.warning("No data for selected period.")
             
     st.divider()
+    
+    # --- Geographic Map ---
     st.markdown("#### 🗺️ Geographic Distribution")
     if not filt_df.empty:
         stats = filt_df.groupby('town').agg(Count=('resale_price','count'), Avg=('resale_price','mean')).reset_index()
@@ -294,6 +317,8 @@ if not df.empty:
             st.info("Map coordinates not available.")
 
     st.divider()
+    
+    # --- [REQUEST 1]: Detailed Data with New Column ---
     st.markdown("#### 📋 Detailed Data")
     
     search_query = st.text_input("🔍 Search by Street Name or Block", "")
@@ -311,6 +336,7 @@ if not df.empty:
             "month": st.column_config.DateColumn("Month"),
             "resale_price": st.column_config.NumberColumn("Price", format="$%d"),
             "floor_area_sqm": st.column_config.NumberColumn("Size (sqm)"),
+            # NEW COLUMN CONFIG
             "price_per_sqm": st.column_config.NumberColumn("Price/Sqm", format="$%d")
         },
         height=400
