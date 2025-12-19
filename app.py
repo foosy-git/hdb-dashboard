@@ -51,38 +51,65 @@ TOWN_COORDS = {
     "YISHUN": {"lat": 1.4304, "lon": 103.8354}
 }
 
-# --- DATA LOADER ---
+# --- SAFE DATA LOADER (FIXED) ---
 @st.cache_data(ttl=3600)
 def load_all_data():
+    # 1. Try loading local cache first
     if os.path.exists(CACHE_FILE):
-        return pd.read_csv(CACHE_FILE)
+        try:
+            return pd.read_csv(CACHE_FILE)
+        except:
+            pass # If file is corrupt, download again
 
     base_url = "https://data.gov.sg/api/action/datastore_search"
     all_records = []
     offset = 0
     limit = 10000 
     
-    progress = st.progress(0)
+    # 2. Visual Progress Indicators
+    status_text = st.empty()
+    progress_bar = st.progress(0)
     
     try:
         while True:
+            # Added Timeout to prevent freezing
             params = {"resource_id": RESOURCE_ID, "limit": limit, "offset": offset, "sort": "month desc"}
-            r = requests.get(base_url, params=params)
+            r = requests.get(base_url, params=params, timeout=10) 
             data = r.json()
+            
             if not data.get('success') or not data['result']['records']: break
-            all_records.extend(data['result']['records'])
-            if len(data['result']['records']) < limit: break
+            
+            new_records = data['result']['records']
+            all_records.extend(new_records)
+            
+            # Update User Interface so you see it moving
+            status_text.text(f"⏳ Downloading HDB Data... {len(all_records):,} rows collected")
+            
+            if len(new_records) < limit: break
             offset += limit
+            
+            # Safety Break (Stop at 300k rows to prevent memory crash)
             if len(all_records) > 300000: break
 
-        progress.empty()
+        # 3. Cleanup UI
+        progress_bar.empty()
+        status_text.empty()
+        
         df = pd.DataFrame(all_records)
+        
+        # 4. Data Cleaning
         if 'month' in df.columns: df['month'] = pd.to_datetime(df['month'])
-        for c in ['resale_price', 'floor_area_sqm', 'lease_commence_date']:
+        cols_to_numeric = ['resale_price', 'floor_area_sqm', 'lease_commence_date']
+        for c in cols_to_numeric:
             if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
+            
+        # Save to cache for next time
         df.to_csv(CACHE_FILE, index=False)
         return df
-    except Exception: return pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"Data Download Failed: {e}")
+        return pd.DataFrame()
 
 # --- HELPER: CONTEXT GENERATOR ---
 def get_dataset_context(df):
