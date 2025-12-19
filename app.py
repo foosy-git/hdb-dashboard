@@ -7,11 +7,16 @@ import google.generativeai as genai
 
 st.set_page_config(page_title="HDB AI Analyst", layout="wide")
 
-# --- 1. SETUP API KEY ---
-# In a real app, use st.secrets. For now, paste your key below or input it in the UI.
-# If you want to keep it safe, look at the "Safety Note" below the code.
-if "GEMINI_API_KEY" not in st.session_state:
-    st.session_state.GEMINI_API_KEY = ""
+# --- 1. SECURE API KEY HANDLING ---
+# Try to get the key from Streamlit Secrets
+try:
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    else:
+        # Fallback for local testing if secrets.toml is missing (Not recommended for prod)
+        api_key = os.getenv("GEMINI_API_KEY") 
+except FileNotFoundError:
+    api_key = None
 
 # --- CONFIGURATION ---
 RESOURCE_ID = "d_8b84c4ee58e3cfc0ece0d773c8ca6abc"
@@ -46,57 +51,37 @@ TOWN_COORDS = {
     "YISHUN": {"lat": 1.4304, "lon": 103.8354}
 }
 
-# --- AI ENGINE (Gemini) ---
-def ask_ai(question, df, api_key):
+# --- AI ENGINE ---
+def ask_ai(question, df):
     if not api_key:
-        return "⚠️ Please enter a Google API Key in the sidebar first."
+        return "⚠️ API Key missing. Please set GEMINI_API_KEY in secrets.", None
     
-    # Configure Gemini
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-pro')
+    model = genai.GenerativeModel('gemini-1.5-flash')
     
-    # Create the Prompt
-    # We teach the AI about your dataframe structure so it can write code for it.
     columns = list(df.columns)
     sample_data = df.head(3).to_string()
     
     prompt = f"""
     You are a Python Data Analyst. 
     You have a pandas dataframe named 'df'.
+    Columns: {columns}
+    Sample: {sample_data}
     
-    Here are the columns: {columns}
-    Here is a sample of the data:
-    {sample_data}
+    User Query: "{question}"
     
-    The user asks: "{question}"
-    
-    Your task:
-    1. Write a SINGLE line of Python code using pandas to solve this.
-    2. The code must return a result (number, string, or dataframe).
-    3. Do NOT use print().
-    4. Do NOT wrap the code in markdown blocks (like ```python).
-    5. Handle casing: 'town' names are usually uppercase (e.g., 'ANG MO KIO').
-    
-    Example Question: "Average price in Bedok"
-    Example Answer: df[df['town']=='BEDOK']['resale_price'].mean()
-    
-    Your Answer:
+    Task: Write 1 line of Python code to answer. Return ONLY the code. No markdown.
+    Example: df[df['town']=='BEDOK']['resale_price'].mean()
     """
     
     try:
-        # Get code from AI
         response = model.generate_content(prompt)
         generated_code = response.text.strip().replace("```python", "").replace("```", "")
-        
-        # Execute the code safely
-        # We use a local scope where 'df' and 'pd' are available
         local_vars = {"df": df, "pd": pd}
         result = eval(generated_code, {"__builtins__": None}, local_vars)
-        
         return result, generated_code
     except Exception as e:
-        return f"Sorry, I couldn't calculate that. (Error: {e})", None
-
+        return f"Could not calculate. ({e})", None
 
 # --- DATA LOADER ---
 @st.cache_data(ttl=3600)
@@ -104,7 +89,7 @@ def load_all_data():
     if os.path.exists(CACHE_FILE):
         return pd.read_csv(CACHE_FILE)
 
-    base_url = "[https://data.gov.sg/api/action/datastore_search](https://data.gov.sg/api/action/datastore_search)"
+    base_url = "https://data.gov.sg/api/action/datastore_search"
     all_records = []
     offset = 0
     limit = 10000 
@@ -136,74 +121,35 @@ def load_all_data():
 
 # --- UI LAYOUT ---
 st.title("🇸🇬 HDB AI Analyst")
-
-# Sidebar for API Key
-with st.sidebar:
-    st.header("🔑 AI Setup")
-    api_input = st.text_input("Enter Google Gemini API Key", type="password")
-    if api_input:
-        st.session_state.GEMINI_API_KEY = api_input
-    st.caption("[Get a free key here](https://aistudio.google.com/app/apikey)")
-    st.divider()
-
-# Load Data
 df = load_all_data()
 
 if not df.empty and 'month' in df.columns:
     df['month'] = pd.to_datetime(df['month'])
 
 if not df.empty:
-    # --- AI CHATBOT SECTION ---
-    st.markdown("### 🤖 Ask the Data")
-    st.info("This AI writes Python code to answer your questions accurately.")
+    # --- AI CHATBOT ---
+    st.markdown("### 🤖 Ask the AI")
     
-    question = st.text_input("Ask a question about HDB prices:", placeholder="e.g., 'What is the most expensive 5 room flat in Ang Mo Kio?'")
-    
-    if question:
-        if not st.session_state.GEMINI_API_KEY:
-            st.error("Please enter your API Key in the sidebar to use the AI.")
-        else:
-            with st.spinner("Analyzing data..."):
-                answer, code = ask_ai(question, df, st.session_state.GEMINI_API_KEY)
-                
-                # Display Result
+    if not api_key:
+        st.warning("🔴 **Developer Note:** API Key is not configured. Please add `GEMINI_API_KEY` to your secrets.")
+    else:
+        question = st.text_input("Ask a question:", placeholder="e.g., 'What is the highest price in Bishan?'")
+        if question:
+            with st.spinner("Thinking..."):
+                answer, code = ask_ai(question, df)
                 st.success(f"**Answer:** {answer}")
-                
-                # Show the 'thinking' process (optional transparency)
-                with st.expander("See how I calculated this (Python Code)"):
-                    st.code(code, language="python")
+                if code:
+                    with st.expander("Show Logic"):
+                        st.code(code, language="python")
 
     st.divider()
 
     # --- STANDARD DASHBOARD ---
     st.subheader("📊 Visual Explorer")
-    
-    # Filters
-    col1, col2 = st.columns(2)
-    with col1:
+    c1, c2 = st.columns(2)
+    with c1:
         towns = sorted(df['town'].astype(str).unique())
         sel_towns = st.multiselect("Towns", towns, default=["ANG MO KIO", "BEDOK"])
-    with col2:
+    with c2:
         types = sorted(df['flat_type'].astype(str).unique())
-        sel_types = st.multiselect("Flat Types", types, default=['4 ROOM'])
-    
-    if sel_towns and sel_types:
-        mask = df['town'].isin(sel_towns) & df['flat_type'].isin(sel_types)
-        filt_df = df[mask]
-        
-        # Map
-        stats = filt_df.groupby('town').agg(
-            Count=('resale_price', 'count'),
-            Avg=('resale_price', 'mean')
-        ).reset_index()
-        stats['lat'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lat'))
-        stats['lon'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lon'))
-        
-        if not stats.dropna().empty:
-            fig = px.scatter_mapbox(
-                stats.dropna(), lat="lat", lon="lon", size="Count", color="Avg",
-                color_continuous_scale="Reds", zoom=10, mapbox_style="carto-positron"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-        st.dataframe(filt_df.sort_values('month', ascending=False).head(100))
+        sel_types = st.mult
