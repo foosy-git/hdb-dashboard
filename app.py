@@ -6,6 +6,7 @@ import os
 import google.generativeai as genai
 import re
 
+# --- App Title in Browser Tab ---
 st.set_page_config(page_title="HDB Resale Prices Analyst", layout="wide")
 
 # --- 1. SECURE API KEY ---
@@ -85,7 +86,7 @@ def load_all_data():
 
 # --- HELPER: CONTEXT GENERATOR ---
 def get_dataset_context(df):
-    """Summarizes data (Price & Volume) for the AI."""
+    """Summarizes data (Price, Volume, Seasonality) for the AI."""
     # 1. Setup Data
     df_context = df.copy()
     df_context['year'] = df_context['month'].dt.year
@@ -99,16 +100,16 @@ def get_dataset_context(df):
     yearly_price = df_context.groupby('year')['resale_price'].mean().to_dict()
     yearly_vol = df_context.groupby('year')['resale_price'].count().to_dict()
     
-    # 4. Peak Volume Month
-    monthly_counts = df_context.groupby('month').size()
-    peak_month = monthly_counts.idxmax().strftime('%Y-%m')
-    peak_val = monthly_counts.max()
+    # 4. Seasonality (Average Volume per Month Name)
+    df_context['month_name'] = df_context['month'].dt.month_name()
+    total_years = df_context['year'].nunique()
+    seasonality = (df_context.groupby('month_name').size() / total_years).astype(int).to_dict()
     
     return f"""
     [Current Year ({latest_year}) Prices]: {price_map}
     [Yearly Avg Price]: {yearly_price}
-    [Yearly Volume (Transactions)]: {yearly_vol}
-    [Highest Volume Month All-Time]: {peak_month} ({peak_val} sales)
+    [Yearly Total Volume]: {yearly_vol}
+    [Average Transactions Per Month (Seasonality)]: {seasonality}
     """
 
 # --- AI ENGINE ---
@@ -131,8 +132,10 @@ def ask_ai(question, df):
     
     STRICT RULES:
     1. **FUTURE PREDICTIONS** (e.g. "Price in 2026?"): Do NOT write code. Write TEXT estimate based on trend.
-    2. **ADVICE** (e.g. "Should I sell?"): Write TEXT only.
-    3. **CALCULATIONS** (e.g. "Most expensive town?", "Average price?", "Highest transactions?"): 
+    2. **ADVICE/ANALYSIS** (e.g. "Lowest month on average?", "Should I sell?"): 
+       - Look at the [Seasonality] or [Yearly Trends] data above.
+       - Write a TEXT response explaining the data.
+    3. **CALCULATIONS** (e.g. "Most expensive town?", "Average price?"): 
        - Write Python code wrapped in ```python ... ```.
        - IMPORTANT: Assign your final answer (as a string) to a variable named `result`.
        - Example:
@@ -269,8 +272,18 @@ if not df.empty:
 
     st.divider()
 
-    # --- AI CHATBOT ---
+    # --- AI CHATBOT (UPDATED WITH EXAMPLES) ---
     st.subheader("🤖 AI Consultant")
+    
+    # Suggestion Chips / Text
+    st.markdown("""
+    **Try asking questions like:**
+    * 💰 *'What is the average price of a 4-room flat in Bedok?'*
+    * 🔎 *'Find towns with 4-room flats under $500k'*
+    * 📊 *'Compare price trends between Tampines and Pasir Ris'*
+    * 📅 *'Which month generally has the lowest transaction volume?'*
+    * 🏠 *'What is the most expensive flat sold in 2024?'*
+    """)
     
     if "messages" not in st.session_state:
         st.session_state.messages = []
