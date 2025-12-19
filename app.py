@@ -6,7 +6,7 @@ import os
 import google.generativeai as genai
 import re
 
-st.set_page_config(page_title="HDB AI Analyst", layout="wide")
+st.set_page_config(page_title="HDB Resale AI Analyst", layout="wide")
 
 # --- 1. SECURE API KEY ---
 try:
@@ -85,6 +85,7 @@ def load_all_data():
 
 # --- HELPER: CONTEXT GENERATOR ---
 def get_dataset_context(df):
+    """Summarizes data for the AI's 'Cheat Sheet'."""
     latest_year = df['month'].dt.year.max()
     recent_df = df[df['month'].dt.year == latest_year]
     
@@ -124,10 +125,10 @@ def ask_ai(question, df):
     3. **CALCULATIONS** (e.g. "Most expensive town?", "Average price?"): 
        - Write Python code wrapped in ```python ... ```.
        - IMPORTANT: Assign your final answer (as a string) to a variable named `result`.
-       - Example Code:
+       - Example:
          ```python
-         top_town = df.groupby('town')['resale_price'].mean().idxmax()
-         result = f"The most expensive town is {{top_town}}."
+         top = df.groupby('town')['resale_price'].mean().idxmax()
+         result = f"The most expensive town is {{top}}."
          ```
     """
     
@@ -140,15 +141,18 @@ def ask_ai(question, df):
         if code_match:
             code = code_match.group(1).strip()
             
-            # Safety Block
+            # Security: Block dangerous file operations
             if "import" in code or "open(" in code: 
                 return "I cannot execute that command for safety reasons.", None
             
-            # EXECUTION (Updated to use exec() for multi-line support)
+            # SETUP EXECUTION ENVIRONMENT
+            # We allow standard builtins (str, len, max) by passing {} as globals
+            # We pass 'df' and 'pd' in locals so the code can use them.
             local_vars = {"df": df, "pd": pd, "result": None}
             
             try:
-                exec(code, {"__builtins__": None}, local_vars)
+                # FIX: Use empty dict {} for globals to allow standard Python builtins
+                exec(code, {}, local_vars)
                 return local_vars.get("result", "Calculation finished but no result returned."), code
             except Exception as e:
                 return f"Calculation Error: {e}", code
