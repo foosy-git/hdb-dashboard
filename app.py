@@ -84,37 +84,30 @@ def load_all_data():
         return df
     except Exception: return pd.DataFrame()
 
-# --- HELPER: CONTEXT GENERATOR (ALL YEARS) ---
+# --- HELPER: CONTEXT GENERATOR ---
 def get_dataset_context(df):
     """Summarizes data (Price, Volume, Seasonality, History) for the AI."""
-    # 1. Setup Data
     df_context = df.copy()
     df_context['year'] = df_context['month'].dt.year
     latest_year = df_context['year'].max()
     
-    # 2. Latest Prices (Crucial for "Current" Value)
+    # Pre-calculated stats for TEXT references (Cheat Sheet)
     recent_df = df_context[df_context['year'] == latest_year]
     current_price_map = recent_df.groupby(['town', 'flat_type'])['resale_price'].mean().to_dict()
-    
-    # 3. Global Trends
     yearly_price = df_context.groupby('year')['resale_price'].mean().to_dict()
     yearly_vol = df_context.groupby('year')['resale_price'].count().to_dict()
     
-    # 4. Seasonality (Avg Volume/Month)
     df_context['month_name'] = df_context['month'].dt.month_name()
     total_years = df_context['year'].nunique()
     seasonality = (df_context.groupby('month_name').size() / total_years).astype(int).to_dict()
     
-    # 5. Full Historical Context
-    # Allows AI to compare specific years (e.g. Bedok 2019 vs 2024)
     historical_map = df_context.groupby(['year', 'town', 'flat_type'])['resale_price'].mean().to_dict()
     
     return f"""
-    [Current Year ({latest_year}) Prices]: {current_price_map}
-    [Yearly Avg Price (Global)]: {yearly_price}
-    [Yearly Total Volume]: {yearly_vol}
-    [Seasonality (Avg Volume/Month)]: {seasonality}
-    [Historical Price Lookup (Year, Town, Type)]: {historical_map}
+    (Reference: Current Year Prices): {current_price_map}
+    (Reference: Global Yearly Trends): {yearly_price}
+    (Reference: Seasonality): {seasonality}
+    (Reference: Detailed History): {historical_map}
     """
 
 # --- AI ENGINE ---
@@ -130,24 +123,28 @@ def ask_ai(question, df):
     prompt = f"""
     You are a Singapore Property Consultant.
     
-    DATA CONTEXT:
+    DATA CONTEXT (Cheat Sheet for TEXT answers only):
     {context_str}
     
     User Question: "{question}"
     
     STRICT RULES:
-    1. **FUTURE PREDICTIONS** (e.g. "Price in 2026?"): Do NOT write code. Write TEXT estimate based on trend.
-    2. **ADVICE/ANALYSIS** (e.g. "Lowest month on average?", "Compare 2019 vs 2024"): 
-       - Look at the [Seasonality], [Yearly Trends], or [Historical Price Lookup] data above.
+    1. **FUTURE PREDICTIONS** (e.g. "Price in 2026?"): Do NOT write code. Write TEXT estimate based on trend references.
+    
+    2. **ADVICE/ANALYSIS** (e.g. "Lowest month?", "Compare 2019 vs 2024"): 
+       - Read the (Reference) data above.
        - Write a TEXT response explaining the data.
-    3. **CALCULATIONS** (e.g. "Most expensive town?", "Average price?"): 
-       - Write Python code wrapped in ```python ... ```.
-       - IMPORTANT: Assign your final answer (as a string) to a variable named `result`.
+    
+    3. **CALCULATIONS** (e.g. "Most expensive town?", "Average price in 2019?"): 
+       - You MUST write Python code using the dataframe `df`.
+       - **CRITICAL:** Do NOT try to use variables like `historical_map` or `price_map` in your Python code. They do not exist in the code environment. You must query `df` directly.
        - Example:
          ```python
-         top = df.groupby('town')['resale_price'].mean().idxmax()
-         result = f"The most expensive town is {{top}}."
+         # Correct way to find max price in 2019
+         res = df[df['month'].dt.year == 2019].groupby('town')['resale_price'].mean().idxmax()
+         result = f"The most expensive town in 2019 was {{res}}."
          ```
+       - Assign your final string answer to variable `result`.
     """
     
     try:
@@ -166,7 +163,6 @@ def ask_ai(question, df):
             local_vars = {"df": df, "pd": pd, "result": None}
             
             try:
-                # Use standard globals (None) to allow len(), max(), etc.
                 exec(code, {}, local_vars)
                 return local_vars.get("result", "Calculation finished but no result returned."), code
             except Exception as e:
