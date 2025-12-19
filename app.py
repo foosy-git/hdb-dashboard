@@ -61,7 +61,6 @@ def load_all_data():
     offset = 0
     limit = 10000 
     
-    # Simple progress bar
     progress = st.progress(0)
     
     try:
@@ -84,31 +83,23 @@ def load_all_data():
         return df
     except Exception: return pd.DataFrame()
 
-# --- HELPER: GENERATE SMART CONTEXT ---
+# --- HELPER: CONTEXT GENERATOR ---
 def get_dataset_context(df):
-    """Creates a 'Cheat Sheet' for the AI with aggregated stats."""
+    """Summarizes recent data to help AI make text-based predictions."""
+    latest_year = df['month'].dt.year.max()
+    recent_df = df[df['month'].dt.year == latest_year]
     
-    # 1. Yearly Trend
+    # Lookup: {(Town, Type): Average Price}
+    price_map = recent_df.groupby(['town', 'flat_type'])['resale_price'].mean().to_dict()
+    
+    # Overall trend
     df['year'] = df['month'].dt.year
     yearly_trend = df.groupby('year')['resale_price'].mean().to_dict()
     
-    # 2. Town Averages (Sorted)
-    town_avg = df.groupby('town')['resale_price'].mean().sort_values(ascending=False)
-    most_expensive = town_avg.head(5).to_dict()
-    least_expensive = town_avg.tail(5).to_dict()
-    
-    # 3. Flat Type Averages
-    type_avg = df.groupby('flat_type')['resale_price'].mean().to_dict()
-    
-    summary = f"""
-    --- DATA CHEAT SHEET ---
-    [Yearly Average Prices]: {yearly_trend}
-    [Most Expensive Towns]: {most_expensive}
-    [Cheapest Towns]: {least_expensive}
-    [Prices by Flat Type]: {type_avg}
-    ------------------------
+    return f"""
+    [Current Year ({latest_year}) Prices by Town/Type]: {price_map}
+    [Overall Yearly Trend]: {yearly_trend}
     """
-    return summary
 
 # --- AI ENGINE ---
 def ask_ai(question, df):
@@ -118,35 +109,35 @@ def ask_ai(question, df):
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel('gemini-2.5-flash')
     
-    # Give the AI the Smart Context
     context_str = get_dataset_context(df)
-    columns = list(df.columns)
     
     prompt = f"""
-    You are a Singapore Property Expert.
+    You are a Singapore Property Consultant.
     
+    DATA CONTEXT:
     {context_str}
     
-    Columns: {columns}
     User Question: "{question}"
     
-    INSTRUCTIONS:
-    1. For ANALYSIS (e.g., "Why is Bishan expensive?", "Trend analysis"): Use the [Most Expensive Towns] and [Yearly Average Prices] data provided above to explain. Do NOT write code. Write a helpful paragraph.
-    
-    2. For RECOMMENDATIONS (e.g., "I have 400k, where to buy?"): Look at the [Cheapest Towns] list above. Suggest specific towns that fit the budget. Do NOT write code.
-    
-    3. For SPECIFIC CALCULATIONS (e.g., "Exact average price in Bedok"): Write Python code wrapped in ```python ... ```.
-    
+    STRICT RULES:
+    1. **FUTURE PREDICTIONS (e.g., "Price in 2026?"):** - Do NOT write Python code (data ends in 2025).
+       - Write a TEXT response estimating based on the [Overall Yearly Trend].
+       
+    2. **CURRENT/PAST FACTS (e.g., "Average price in 2024?"):**
+       - Write Python code wrapped in ```python ... ```.
+       
+    3. **ADVICE (e.g., "Should I sell?"):**
+       - Write a text response based on trends. No code.
     """
     
     try:
         response = model.generate_content(prompt)
         text = response.text.strip()
         
-        # Check for code
         code_match = re.search(r"```python(.*?)```", text, re.DOTALL)
         if code_match:
             code = code_match.group(1).strip()
+            if "import" in code or "open(" in code: return "Safety Block.", None
             local_vars = {"df": df, "pd": pd}
             result = eval(code, {"__builtins__": None}, local_vars)
             return result, code
@@ -165,92 +156,86 @@ if not df.empty and 'month' in df.columns:
 
 if not df.empty:
     
-    # --- GLOBAL FILTERS (SIDEBAR) ---
+    # --- SIDEBAR FILTERS ---
     st.sidebar.header("Filter Settings")
     
-    # Town Filter
+    # 1. DATE FILTER (Restored!)
+    min_date = df['month'].min().date()
+    max_date = df['month'].max().date()
+    start_date, end_date = st.sidebar.date_input(
+        "Date Range", 
+        value=(min_date, max_date), 
+        min_value=min_date, 
+        max_value=max_date
+    )
+
+    # 2. TOWN FILTER
     all_towns = sorted(df['town'].astype(str).unique())
-    sel_towns = st.sidebar.multiselect("Select Towns", all_towns, default=["ANG MO KIO", "BEDOK"])
+    sel_towns = st.sidebar.multiselect("Towns", all_towns, default=["ANG MO KIO", "BEDOK"])
     
-    # Flat Type Filter
+    # 3. TYPE FILTER
     all_types = sorted(df['flat_type'].astype(str).unique())
     default_types = ['4 ROOM'] if '4 ROOM' in all_types else [all_types[0]]
     sel_types = st.sidebar.multiselect("Flat Types", all_types, default=default_types)
     
-    # Apply Filters
-    # (If nothing selected, show everything to avoid empty charts)
+    # Default to 'All' if selection empty
     if not sel_towns: sel_towns = all_towns
     if not sel_types: sel_types = all_types
     
-    mask = df['town'].isin(sel_towns) & df['flat_type'].isin(sel_types)
-    filt_df = df[mask]
+    # --- APPLY FILTERS ---
+    mask_date = (df['month'].dt.date >= start_date) & (df['month'].dt.date <= end_date)
+    mask_town = df['town'].isin(sel_towns)
+    mask_type = df['flat_type'].isin(sel_types)
+    
+    filt_df = df[mask_date & mask_town & mask_type].copy()
 
-    # --- 1. VISUAL DASHBOARD ---
-    # We place this FIRST so it's always visible
+    # --- VISUAL DASHBOARD ---
     st.subheader("📊 Visual Explorer")
-    
     c1, c2, c3 = st.columns(3)
-    c1.metric("Selected Volume", f"{len(filt_df):,}")
-    c2.metric("Avg Price", f"${filt_df['resale_price'].mean():,.0f}")
-    c3.metric("Max Price", f"${filt_df['resale_price'].max():,.0f}")
+    if not filt_df.empty:
+        c1.metric("Volume", f"{len(filt_df):,}")
+        c2.metric("Avg Price", f"${filt_df['resale_price'].mean():,.0f}")
+        c3.metric("Max Price", f"${filt_df['resale_price'].max():,.0f}")
     
-    # TABS for Charts
-    tab1, tab2 = st.tabs(["📈 Trend Chart", "🗺️ Map View"])
-    
+    tab1, tab2 = st.tabs(["📈 Trend", "🗺️ Map"])
     with tab1:
         if not filt_df.empty:
-            # Group by Month & Town for multi-line chart
             trend_data = filt_df.groupby(['month', 'town'])['resale_price'].mean().reset_index().sort_values('month')
-            fig_line = px.line(trend_data, x='month', y='resale_price', color='town', title="Price Trend Over Time")
-            st.plotly_chart(fig_line, use_container_width=True)
+            fig = px.line(trend_data, x='month', y='resale_price', color='town')
+            st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No data for trend chart.")
-
+            st.warning("No data for selected period.")
+            
     with tab2:
         if not filt_df.empty:
-            town_stats = filt_df.groupby('town').agg(
-                Count=('resale_price', 'count'), Avg=('resale_price', 'mean')
-            ).reset_index()
-            # Add Coords
-            town_stats['lat'] = town_stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lat'))
-            town_stats['lon'] = town_stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lon'))
-            
-            if not town_stats.dropna().empty:
-                fig_map = px.scatter_mapbox(
-                    town_stats.dropna(), lat="lat", lon="lon", size="Count", color="Avg",
-                    color_continuous_scale="Reds", zoom=10, mapbox_style="carto-positron"
-                )
-                st.plotly_chart(fig_map, use_container_width=True)
-            else:
-                st.warning("Map coordinates missing.")
+            stats = filt_df.groupby('town').agg(Count=('resale_price','count'), Avg=('resale_price','mean')).reset_index()
+            stats['lat'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lat'))
+            stats['lon'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lon'))
+            if not stats.dropna().empty:
+                fig = px.scatter_mapbox(stats.dropna(), lat="lat", lon="lon", size="Count", color="Avg", zoom=10, mapbox_style="carto-positron")
+                st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
-    # --- 2. AI CHATBOT ---
+    # --- AI CHATBOT ---
     st.subheader("🤖 AI Consultant")
-    st.caption("Ask: 'Where can I find a 400k flat?', 'Why is Bishan expensive?', 'Analyze the trend'")
-
-    # Chat UI
+    
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
     for msg in st.session_state.messages:
         st.chat_message(msg["role"]).write(msg["content"])
 
-    if prompt := st.chat_input("Ask your question..."):
+    if prompt := st.chat_input("Ask about prices, trends, or predictions..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
         
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                # Pass FULL dataframe to AI so it knows global context
-                answer, code = ask_ai(prompt, df) 
+            with st.spinner("Analyzing..."):
+                answer, code = ask_ai(prompt, df)
                 st.write(answer)
                 if code:
-                    with st.expander("Show Calculation"):
+                    with st.expander("View Code"):
                         st.code(code)
         
         st.session_state.messages.append({"role": "assistant", "content": answer})
-
-else:
-    st.error("Data could not be loaded.")
