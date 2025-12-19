@@ -6,7 +6,7 @@ import os
 import google.generativeai as genai
 import re
 
-st.set_page_config(page_title="HDB Resale AI Analyst", layout="wide")
+st.set_page_config(page_title="HDB Resale Prices AI Analyst", layout="wide")
 
 # --- 1. SECURE API KEY ---
 try:
@@ -85,14 +85,10 @@ def load_all_data():
 
 # --- HELPER: CONTEXT GENERATOR ---
 def get_dataset_context(df):
-    """Summarizes data for the AI's 'Cheat Sheet'."""
     latest_year = df['month'].dt.year.max()
     recent_df = df[df['month'].dt.year == latest_year]
     
-    # Lookup: {(Town, Type): Average Price}
     price_map = recent_df.groupby(['town', 'flat_type'])['resale_price'].mean().to_dict()
-    
-    # Overall trend
     df['year'] = df['month'].dt.year
     yearly_trend = df.groupby('year')['resale_price'].mean().to_dict()
     
@@ -136,22 +132,17 @@ def ask_ai(question, df):
         response = model.generate_content(prompt)
         text = response.text.strip()
         
-        # Check for code block
         code_match = re.search(r"```python(.*?)```", text, re.DOTALL)
         if code_match:
             code = code_match.group(1).strip()
             
-            # Security: Block dangerous file operations
             if "import" in code or "open(" in code: 
                 return "I cannot execute that command for safety reasons.", None
             
-            # SETUP EXECUTION ENVIRONMENT
-            # We allow standard builtins (str, len, max) by passing {} as globals
-            # We pass 'df' and 'pd' in locals so the code can use them.
+            # Allow standard builtins by passing empty globals {}
             local_vars = {"df": df, "pd": pd, "result": None}
             
             try:
-                # FIX: Use empty dict {} for globals to allow standard Python builtins
                 exec(code, {}, local_vars)
                 return local_vars.get("result", "Calculation finished but no result returned."), code
             except Exception as e:
@@ -163,7 +154,7 @@ def ask_ai(question, df):
         return f"AI Error: {e}", None
 
 # --- MAIN APP UI ---
-st.title("🇸🇬 HDB AI Analyst")
+st.title("🇸🇬 HDB Resale Prices AI Analyst")
 
 df = load_all_data()
 if not df.empty and 'month' in df.columns:
@@ -233,6 +224,31 @@ if not df.empty:
             st.plotly_chart(fig_map, use_container_width=True)
         else:
             st.info("Map coordinates not available.")
+
+    # --- DATA TABLE (RESTORED) ---
+    st.divider()
+    st.markdown("#### 📋 Detailed Data")
+    
+    # Search Filter
+    search_query = st.text_input("🔍 Search by Street Name or Block", "")
+    if search_query:
+        # Filter logic
+        display_df = filt_df[
+            filt_df['street_name'].astype(str).str.contains(search_query, case=False, na=False) | 
+            filt_df['block'].astype(str).str.contains(search_query, case=False, na=False)
+        ]
+    else:
+        display_df = filt_df
+
+    st.dataframe(
+        display_df.sort_values('month', ascending=False),
+        column_config={
+            "month": st.column_config.DateColumn("Month"),
+            "resale_price": st.column_config.NumberColumn("Price", format="$%d"),
+            "floor_area_sqm": st.column_config.NumberColumn("Size (sqm)")
+        },
+        height=400
+    )
 
     st.divider()
 
