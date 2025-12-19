@@ -3,14 +3,19 @@ import pandas as pd
 import requests
 import plotly.express as px
 import os
+import google.generativeai as genai
 
-st.set_page_config(page_title="HDB Analytics Pro", layout="wide")
+st.set_page_config(page_title="HDB AI Analyst", layout="wide")
+
+# --- 1. SETUP API KEY ---
+# In a real app, use st.secrets. For now, paste your key below or input it in the UI.
+# If you want to keep it safe, look at the "Safety Note" below the code.
+if "GEMINI_API_KEY" not in st.session_state:
+    st.session_state.GEMINI_API_KEY = ""
 
 # --- CONFIGURATION ---
 RESOURCE_ID = "d_8b84c4ee58e3cfc0ece0d773c8ca6abc"
 CACHE_FILE = "hdb_full_data_cache.csv"
-
-# --- STATIC DATA: HDB TOWN COORDINATES ---
 TOWN_COORDS = {
     "ANG MO KIO": {"lat": 1.3691, "lon": 103.8454},
     "BEDOK": {"lat": 1.3236, "lon": 103.9273},
@@ -41,184 +46,164 @@ TOWN_COORDS = {
     "YISHUN": {"lat": 1.4304, "lon": 103.8354}
 }
 
+# --- AI ENGINE (Gemini) ---
+def ask_ai(question, df, api_key):
+    if not api_key:
+        return "⚠️ Please enter a Google API Key in the sidebar first."
+    
+    # Configure Gemini
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-pro')
+    
+    # Create the Prompt
+    # We teach the AI about your dataframe structure so it can write code for it.
+    columns = list(df.columns)
+    sample_data = df.head(3).to_string()
+    
+    prompt = f"""
+    You are a Python Data Analyst. 
+    You have a pandas dataframe named 'df'.
+    
+    Here are the columns: {columns}
+    Here is a sample of the data:
+    {sample_data}
+    
+    The user asks: "{question}"
+    
+    Your task:
+    1. Write a SINGLE line of Python code using pandas to solve this.
+    2. The code must return a result (number, string, or dataframe).
+    3. Do NOT use print().
+    4. Do NOT wrap the code in markdown blocks (like ```python).
+    5. Handle casing: 'town' names are usually uppercase (e.g., 'ANG MO KIO').
+    
+    Example Question: "Average price in Bedok"
+    Example Answer: df[df['town']=='BEDOK']['resale_price'].mean()
+    
+    Your Answer:
+    """
+    
+    try:
+        # Get code from AI
+        response = model.generate_content(prompt)
+        generated_code = response.text.strip().replace("```python", "").replace("```", "")
+        
+        # Execute the code safely
+        # We use a local scope where 'df' and 'pd' are available
+        local_vars = {"df": df, "pd": pd}
+        result = eval(generated_code, {"__builtins__": None}, local_vars)
+        
+        return result, generated_code
+    except Exception as e:
+        return f"Sorry, I couldn't calculate that. (Error: {e})", None
+
+
 # --- DATA LOADER ---
 @st.cache_data(ttl=3600)
 def load_all_data():
     if os.path.exists(CACHE_FILE):
         return pd.read_csv(CACHE_FILE)
 
-    base_url = "https://data.gov.sg/api/action/datastore_search"
+    base_url = "[https://data.gov.sg/api/action/datastore_search](https://data.gov.sg/api/action/datastore_search)"
     all_records = []
     offset = 0
     limit = 10000 
     
-    # Progress UI
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    progress = st.progress(0)
+    status = st.empty()
     
     try:
         while True:
-            params = {
-                "resource_id": RESOURCE_ID,
-                "limit": limit,
-                "offset": offset,
-                "sort": "month desc"
-            }
-            response = requests.get(base_url, params=params)
-            data = response.json()
-            
-            if not data.get('success'): break
-            records = data['result']['records']
-            if not records: break
-                
-            all_records.extend(records)
-            status_text.text(f"Downloaded {len(all_records):,} records...")
-            
-            if len(records) < limit: break
+            params = {"resource_id": RESOURCE_ID, "limit": limit, "offset": offset, "sort": "month desc"}
+            r = requests.get(base_url, params=params)
+            data = r.json()
+            if not data.get('success') or not data['result']['records']: break
+            all_records.extend(data['result']['records'])
+            status.text(f"Downloaded {len(all_records):,} records...")
+            if len(data['result']['records']) < limit: break
             offset += limit
-            if len(all_records) > 300000: break 
+            if len(all_records) > 300000: break
 
-        progress_bar.empty()
-        status_text.empty()
-        
+        progress.empty()
+        status.empty()
         df = pd.DataFrame(all_records)
-        # Type conversion
         if 'month' in df.columns: df['month'] = pd.to_datetime(df['month'])
-        cols = ['resale_price', 'floor_area_sqm', 'lease_commence_date']
-        for c in cols:
+        for c in ['resale_price', 'floor_area_sqm', 'lease_commence_date']:
             if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
-
         df.to_csv(CACHE_FILE, index=False)
         return df
+    except Exception: return pd.DataFrame()
 
-    except Exception as e:
-        st.error(f"Download Error: {e}")
-        return pd.DataFrame()
+# --- UI LAYOUT ---
+st.title("🇸🇬 HDB AI Analyst")
 
-# --- MAIN APP ---
-st.title("🇸🇬 Unified HDB Dashboard")
+# Sidebar for API Key
+with st.sidebar:
+    st.header("🔑 AI Setup")
+    api_input = st.text_input("Enter Google Gemini API Key", type="password")
+    if api_input:
+        st.session_state.GEMINI_API_KEY = api_input
+    st.caption("[Get a free key here](https://aistudio.google.com/app/apikey)")
+    st.divider()
 
-with st.spinner("Loading Database..."):
-    df = load_all_data()
-    if not df.empty and 'month' in df.columns:
-        df['month'] = pd.to_datetime(df['month'])
+# Load Data
+df = load_all_data()
+
+if not df.empty and 'month' in df.columns:
+    df['month'] = pd.to_datetime(df['month'])
 
 if not df.empty:
-    # --- 1. GLOBAL SIDEBAR FILTERS ---
-    st.sidebar.header("Global Filters")
-    st.sidebar.info("Filters update Map, Chart, and Table.")
+    # --- AI CHATBOT SECTION ---
+    st.markdown("### 🤖 Ask the Data")
+    st.info("This AI writes Python code to answer your questions accurately.")
     
-    # Date Filter
-    min_date = df['month'].min().date()
-    max_date = df['month'].max().date()
-    st.sidebar.subheader("1. Date Range")
-    start_date, end_date = st.sidebar.date_input("Select Period", (min_date, max_date), min_value=min_date, max_value=max_date)
-
-    # Town Filter
-    st.sidebar.subheader("2. Select Towns")
-    all_towns = sorted(df['town'].astype(str).unique())
-    selected_towns = st.sidebar.multiselect("Select Towns", all_towns, default=["ANG MO KIO", "BEDOK", "CLEMENTI"])
-
-    # Flat Type Filter (UPDATED to Multiselect)
-    st.sidebar.subheader("3. Flat Type")
-    flat_types = sorted(df['flat_type'].astype(str).unique())
-    # Default to '4 ROOM' if available
-    default_opts = ['4 ROOM'] if '4 ROOM' in flat_types else [flat_types[0]]
-    selected_flats = st.sidebar.multiselect("Choose Types", flat_types, default=default_opts)
-
-    # --- 2. APPLY FILTERS ---
-    if not selected_towns or not selected_flats:
-        st.warning("Please select at least one Town and one Flat Type.")
-    else:
-        mask_date = (df['month'].dt.date >= start_date) & (df['month'].dt.date <= end_date)
-        mask_town = (df['town'].isin(selected_towns))
-        mask_type = (df['flat_type'].isin(selected_flats)) # Updated to .isin()
-        
-        filtered_df = df[mask_date & mask_town & mask_type].copy()
-
-        if filtered_df.empty:
-            st.warning("No data found for the selected combination.")
+    question = st.text_input("Ask a question about HDB prices:", placeholder="e.g., 'What is the most expensive 5 room flat in Ang Mo Kio?'")
+    
+    if question:
+        if not st.session_state.GEMINI_API_KEY:
+            st.error("Please enter your API Key in the sidebar to use the AI.")
         else:
-            # --- 3. METRICS ---
-            st.markdown("### 📊 Market Snapshot")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Selected Transactions", f"{len(filtered_df):,}")
-            col2.metric("Average Price", f"${filtered_df['resale_price'].mean():,.0f}")
-            col3.metric("Lowest Price", f"${filtered_df['resale_price'].min():,.0f}")
-            col4.metric("Highest Price", f"${filtered_df['resale_price'].max():,.0f}")
+            with st.spinner("Analyzing data..."):
+                answer, code = ask_ai(question, df, st.session_state.GEMINI_API_KEY)
+                
+                # Display Result
+                st.success(f"**Answer:** {answer}")
+                
+                # Show the 'thinking' process (optional transparency)
+                with st.expander("See how I calculated this (Python Code)"):
+                    st.code(code, language="python")
 
-            # --- 4. MAP VISUALIZATION (RED SCALE) ---
-            st.divider()
-            st.subheader(f"🗺️ Geographic Distribution (Darker Red = More Expensive)")
-            
-            # Aggregate stats
-            town_stats = filtered_df.groupby('town').agg(
-                Count=('resale_price', 'count'),
-                Avg_Price=('resale_price', 'mean'),
-                Min_Price=('resale_price', 'min'),
-                Max_Price=('resale_price', 'max')
-            ).reset_index()
+    st.divider()
 
-            # Add GPS
-            town_stats['lat'] = town_stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lat'))
-            town_stats['lon'] = town_stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lon'))
-            town_stats = town_stats.dropna(subset=['lat', 'lon'])
-
-            if not town_stats.empty:
-                fig_map = px.scatter_mapbox(
-                    town_stats,
-                    lat="lat",
-                    lon="lon",
-                    size="Count", 
-                    color="Avg_Price",
-                    # UPDATED COLOR SCALE: "Reds"
-                    color_continuous_scale="Reds", 
-                    size_max=40, zoom=10,
-                    mapbox_style="carto-positron",
-                    hover_name="town",
-                    hover_data={"lat":False, "lon":False, "Avg_Price":":,.0f", "Count":":,"},
-                    title="Bubble Size = Volume | Color Intensity = Price"
-                )
-                st.plotly_chart(fig_map, use_container_width=True)
-            
-            # --- 5. TREND CHART ---
-            st.divider()
-            st.subheader("📈 Price Trends")
-            
-            # Group by Month & Town
-            trend_df = filtered_df.groupby(['month', 'town'])['resale_price'].mean().reset_index().sort_values('month')
-            
-            fig_line = px.line(
-                trend_df, x='month', y='resale_price', color='town', markers=True,
-                title=f"Monthly Average Price (Combined: {', '.join(selected_flats)})",
-                labels={'resale_price': 'Price (SGD)', 'month': 'Date'}
+    # --- STANDARD DASHBOARD ---
+    st.subheader("📊 Visual Explorer")
+    
+    # Filters
+    col1, col2 = st.columns(2)
+    with col1:
+        towns = sorted(df['town'].astype(str).unique())
+        sel_towns = st.multiselect("Towns", towns, default=["ANG MO KIO", "BEDOK"])
+    with col2:
+        types = sorted(df['flat_type'].astype(str).unique())
+        sel_types = st.multiselect("Flat Types", types, default=['4 ROOM'])
+    
+    if sel_towns and sel_types:
+        mask = df['town'].isin(sel_towns) & df['flat_type'].isin(sel_types)
+        filt_df = df[mask]
+        
+        # Map
+        stats = filt_df.groupby('town').agg(
+            Count=('resale_price', 'count'),
+            Avg=('resale_price', 'mean')
+        ).reset_index()
+        stats['lat'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lat'))
+        stats['lon'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lon'))
+        
+        if not stats.dropna().empty:
+            fig = px.scatter_mapbox(
+                stats.dropna(), lat="lat", lon="lon", size="Count", color="Avg",
+                color_continuous_scale="Reds", zoom=10, mapbox_style="carto-positron"
             )
-            st.plotly_chart(fig_line, use_container_width=True)
-
-            # --- 6. TABLE ---
-            st.divider()
-            st.subheader("📋 Transaction Search")
+            st.plotly_chart(fig, use_container_width=True)
             
-            search_query = st.text_input("🔍 Filter (Street Name or Block):", "")
-            
-            if search_query:
-                search_mask = (
-                    filtered_df['street_name'].str.contains(search_query, case=False, na=False) |
-                    filtered_df['block'].str.contains(search_query, case=False, na=False)
-                )
-                display_df = filtered_df[search_mask]
-            else:
-                display_df = filtered_df
-
-            st.dataframe(
-                display_df.sort_values('month', ascending=False),
-                column_config={
-                    "month": st.column_config.DateColumn("Month"),
-                    "resale_price": st.column_config.NumberColumn("Price", format="$%d"),
-                    "remaining_lease": st.column_config.TextColumn("Lease Left")
-                },
-                height=400
-            )
-
-else:
-    st.error("Unable to load data.")
+        st.dataframe(filt_df.sort_values('month', ascending=False).head(100))
