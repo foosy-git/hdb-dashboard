@@ -51,7 +51,7 @@ TOWN_COORDS = {
     "YISHUN": {"lat": 1.4304, "lon": 103.8354}
 }
 
-# --- SAFE DATA LOADER (FIXED) ---
+# --- SAFE DATA LOADER (UPDATED TIMEOUT) ---
 @st.cache_data(ttl=3600)
 def load_all_data():
     # 1. Try loading local cache first
@@ -72,9 +72,9 @@ def load_all_data():
     
     try:
         while True:
-            # Added Timeout to prevent freezing
+            # INCREASED TIMEOUT TO 60 SECONDS
             params = {"resource_id": RESOURCE_ID, "limit": limit, "offset": offset, "sort": "month desc"}
-            r = requests.get(base_url, params=params, timeout=10) 
+            r = requests.get(base_url, params=params, timeout=60) 
             data = r.json()
             
             if not data.get('success') or not data['result']['records']: break
@@ -82,13 +82,12 @@ def load_all_data():
             new_records = data['result']['records']
             all_records.extend(new_records)
             
-            # Update User Interface so you see it moving
+            # Update User Interface
             status_text.text(f"⏳ Downloading HDB Data... {len(all_records):,} rows collected")
             
             if len(new_records) < limit: break
             offset += limit
             
-            # Safety Break (Stop at 300k rows to prevent memory crash)
             if len(all_records) > 300000: break
 
         # 3. Cleanup UI
@@ -103,7 +102,7 @@ def load_all_data():
         for c in cols_to_numeric:
             if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
             
-        # Save to cache for next time
+        # Save to cache
         df.to_csv(CACHE_FILE, index=False)
         return df
 
@@ -118,7 +117,6 @@ def get_dataset_context(df):
     df_context['year'] = df_context['month'].dt.year
     latest_year = df_context['year'].max()
     
-    # Pre-calculated stats for TEXT references (Cheat Sheet)
     recent_df = df_context[df_context['year'] == latest_year]
     current_price_map = recent_df.groupby(['town', 'flat_type'])['resale_price'].mean().to_dict()
     yearly_price = df_context.groupby('year')['resale_price'].mean().to_dict()
@@ -178,7 +176,6 @@ def ask_ai(question, df):
         response = model.generate_content(prompt)
         text = response.text.strip()
         
-        # Check for code block
         code_match = re.search(r"```python(.*?)```", text, re.DOTALL)
         if code_match:
             code = code_match.group(1).strip()
@@ -186,7 +183,6 @@ def ask_ai(question, df):
             if "import" in code or "open(" in code: 
                 return "I cannot execute that command for safety reasons.", None
             
-            # Execution Environment
             local_vars = {"df": df, "pd": pd, "result": None}
             
             try:
@@ -212,7 +208,6 @@ if not df.empty:
     # --- SIDEBAR FILTERS ---
     st.sidebar.header("Filter Settings")
     
-    # 1. Date Filter
     min_date = df['month'].min().date()
     max_date = df['month'].max().date()
     start_date, end_date = st.sidebar.date_input(
@@ -222,11 +217,9 @@ if not df.empty:
         max_value=max_date
     )
 
-    # 2. Town Filter
     all_towns = sorted(df['town'].astype(str).unique())
     sel_towns = st.sidebar.multiselect("Towns", all_towns, default=["ANG MO KIO", "BEDOK"])
     
-    # 3. Type Filter
     all_types = sorted(df['flat_type'].astype(str).unique())
     default_types = ['4 ROOM'] if '4 ROOM' in all_types else [all_types[0]]
     sel_types = st.sidebar.multiselect("Flat Types", all_types, default=default_types)
@@ -234,7 +227,6 @@ if not df.empty:
     if not sel_towns: sel_towns = all_towns
     if not sel_types: sel_types = all_types
     
-    # Apply Filters
     mask_date = (df['month'].dt.date >= start_date) & (df['month'].dt.date <= end_date)
     mask_town = df['town'].isin(sel_towns)
     mask_type = df['flat_type'].isin(sel_types)
@@ -249,7 +241,6 @@ if not df.empty:
         c2.metric("Avg Price", f"${filt_df['resale_price'].mean():,.0f}")
         c3.metric("Max Price", f"${filt_df['resale_price'].max():,.0f}")
     
-    # --- CHART 1: TREND (TOP) ---
     st.divider()
     st.markdown("#### 📈 Price Trends")
     if not filt_df.empty:
@@ -259,7 +250,6 @@ if not df.empty:
     else:
         st.warning("No data for selected period.")
             
-    # --- CHART 2: MAP (BOTTOM) ---
     st.divider()
     st.markdown("#### 🗺️ Geographic Distribution")
     if not filt_df.empty:
@@ -275,7 +265,6 @@ if not df.empty:
         else:
             st.info("Map coordinates not available.")
 
-    # --- DATA TABLE ---
     st.divider()
     st.markdown("#### 📋 Detailed Data")
     
@@ -300,7 +289,6 @@ if not df.empty:
 
     st.divider()
 
-    # --- AI CHATBOT (UPDATED) ---
     st.subheader("🤖 AI Consultant")
     
     st.markdown("""
