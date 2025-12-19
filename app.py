@@ -51,7 +51,7 @@ TOWN_COORDS = {
     "YISHUN": {"lat": 1.4304, "lon": 103.8354}
 }
 
-# --- SAFE DATA LOADER ---
+# --- SAFE DATA LOADER (UPDATED WITH PSM CALCULATION) ---
 @st.cache_data(ttl=3600)
 def load_all_data():
     if os.path.exists(CACHE_FILE):
@@ -70,7 +70,7 @@ def load_all_data():
     
     try:
         while True:
-            # 60 Second Timeout for slow connections
+            # 60 Second Timeout
             params = {"resource_id": RESOURCE_ID, "limit": limit, "offset": offset, "sort": "month desc"}
             r = requests.get(base_url, params=params, timeout=60) 
             data = r.json()
@@ -95,6 +95,10 @@ def load_all_data():
         cols_to_numeric = ['resale_price', 'floor_area_sqm', 'lease_commence_date']
         for c in cols_to_numeric:
             if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
+        
+        # --- NEW: Calculate Price Per Sqm ---
+        if 'resale_price' in df.columns and 'floor_area_sqm' in df.columns:
+            df['price_per_sqm'] = df['resale_price'] / df['floor_area_sqm']
             
         df.to_csv(CACHE_FILE, index=False)
         return df
@@ -103,9 +107,9 @@ def load_all_data():
         st.error(f"Data Download Failed: {e}")
         return pd.DataFrame()
 
-# --- HELPER: CONTEXT GENERATOR (UPDATED WITH BLOCK ANALYSIS) ---
+# --- HELPER: CONTEXT GENERATOR (UPDATED WITH PSM) ---
 def get_dataset_context(df):
-    """Summarizes data (Price, Volume, Seasonality, Block Highlights) for the AI."""
+    """Summarizes data (Price, Volume, Seasonality, Block Highlights, PSM) for the AI."""
     df_context = df.copy()
     df_context['year'] = df_context['month'].dt.year
     latest_year = df_context['year'].max()
@@ -113,7 +117,15 @@ def get_dataset_context(df):
     # 1. Standard Summaries
     recent_df = df_context[df_context['year'] == latest_year]
     current_price_map = recent_df.groupby(['town', 'flat_type'])['resale_price'].mean().to_dict()
+    
+    # --- NEW: Current PSM Map ---
+    current_psm_map = recent_df.groupby(['town', 'flat_type'])['price_per_sqm'].mean().to_dict()
+    
     yearly_price = df_context.groupby('year')['resale_price'].mean().to_dict()
+    
+    # --- NEW: Yearly PSM Trend ---
+    yearly_psm = df_context.groupby('year')['price_per_sqm'].mean().to_dict()
+    
     yearly_vol = df_context.groupby('year')['resale_price'].count().to_dict()
     
     df_context['month_name'] = df_context['month'].dt.month_name()
@@ -123,13 +135,10 @@ def get_dataset_context(df):
     # 2. Historical Town/Type Map
     historical_map = df_context.groupby(['year', 'town', 'flat_type'])['resale_price'].mean().to_dict()
     
-    # 3. NEW: Block Highlights (Top 1 Most Expensive Block per Town)
-    # We aggregate by block to find the "Premium Blocks" in each area
+    # 3. Block Highlights (Top 1 Most Expensive Block per Town)
     block_df = df_context.groupby(['town', 'block'])['resale_price'].mean().reset_index()
-    # Sort by Town (Asc) and Price (Desc)
     top_blocks = block_df.sort_values(['town', 'resale_price'], ascending=[True, False]).drop_duplicates('town')
     
-    # Create a readable string map: {'ANG MO KIO': 'Block 310A ($1,200,000)', ...}
     top_block_map = {
         row['town']: f"Block {row['block']} (Avg ${row['resale_price']:,.0f})"
         for _, row in top_blocks.iterrows()
@@ -137,7 +146,9 @@ def get_dataset_context(df):
     
     return f"""
     (Reference: Current Year Prices): {current_price_map}
-    (Reference: Global Yearly Trends): {yearly_price}
+    (Reference: Current Year Price Per Sqm): {current_psm_map}
+    (Reference: Global Yearly Trends - Total Price): {yearly_price}
+    (Reference: Global Yearly Trends - Price Per Sqm): {yearly_psm}
     (Reference: Seasonality): {seasonality}
     (Reference: Detailed History): {historical_map}
     (Reference: Most Expensive Block in Each Town): {top_block_map}
@@ -164,20 +175,20 @@ def ask_ai(question, df):
     STRICT RULES:
     1. **FUTURE PREDICTIONS** (e.g. "Price in 2026?"): Do NOT write code. Write TEXT estimate based on trend references.
     
-    2. **ADVICE/ANALYSIS** (e.g. "Lowest month?", "Best block in Bedok?"): 
+    2. **ADVICE/ANALYSIS** (e.g. "Lowest month?", "Best block in Bedok?", "Price per sqm trends"): 
        - Read the (Reference) data above.
-       - You can mention the "Most Expensive Block" from the reference list.
+       - You can mention the "Most Expensive Block" or "Price Per Sqm" trends.
        - Write a TEXT response.
     
-    3. **CALCULATIONS** (e.g. "Average price of Block 123?", "Count transactions in 2024?"): 
+    3. **CALCULATIONS** (e.g. "Average price of Block 123?", "Price per sqm in Tampines?"): 
        - You MUST write Python code using the dataframe `df`.
-       - The dataframe contains columns: `town`, `block`, `street_name`, `flat_type`, `resale_price`, `month`.
+       - The dataframe contains columns: `town`, `block`, `street_name`, `flat_type`, `resale_price`, `floor_area_sqm`, `price_per_sqm`, `month`.
        - **CRITICAL:** Do NOT try to use variables like `top_block_map` in your Python code. Query `df` directly.
        - Example:
          ```python
-         # Correct way to query a specific block
-         avg = df[(df['town']=='BEDOK') & (df['block']=='123')]['resale_price'].mean()
-         result = f"The average price at Block 123 Bedok is ${{avg:,.0f}}."
+         # Correct way to query price per sqm
+         avg_psm = df[df['town']=='BEDOK']['price_per_sqm'].mean()
+         result = f"The average price per sqm in Bedok is ${{avg_psm:,.0f}}."
          ```
        - Assign your final string answer to variable `result`.
     """
@@ -246,20 +257,37 @@ if not df.empty:
 
     # --- VISUAL DASHBOARD ---
     st.subheader("📊 Visual Explorer")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4) # Changed to 4 columns to fit PSM metric
     if not filt_df.empty:
         c1.metric("Volume", f"{len(filt_df):,}")
         c2.metric("Avg Price", f"${filt_df['resale_price'].mean():,.0f}")
-        c3.metric("Max Price", f"${filt_df['resale_price'].max():,.0f}")
+        c3.metric("Avg Price/Sqm", f"${filt_df['price_per_sqm'].mean():,.0f}") # NEW METRIC
+        c4.metric("Max Price", f"${filt_df['resale_price'].max():,.0f}")
     
     st.divider()
-    st.markdown("#### 📈 Price Trends")
-    if not filt_df.empty:
-        trend_data = filt_df.groupby(['month', 'town'])['resale_price'].mean().reset_index().sort_values('month')
-        fig = px.line(trend_data, x='month', y='resale_price', color='town')
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("No data for selected period.")
+    
+    # --- CHART SECTION (UPDATED WITH TABS) ---
+    st.markdown("#### 📈 Market Trends")
+    
+    # Create Tabs for different views
+    tab_price, tab_psm = st.tabs(["💰 Total Price Trend", "📏 Price per Sqm Trend"])
+    
+    with tab_price:
+        if not filt_df.empty:
+            trend_data = filt_df.groupby(['month', 'town'])['resale_price'].mean().reset_index().sort_values('month')
+            fig = px.line(trend_data, x='month', y='resale_price', color='town', title="Average Total Price over Time")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("No data for selected period.")
+
+    with tab_psm:
+        if not filt_df.empty:
+            # NEW CHART: Price Per Sqm
+            psm_data = filt_df.groupby(['month', 'town'])['price_per_sqm'].mean().reset_index().sort_values('month')
+            fig_psm = px.line(psm_data, x='month', y='price_per_sqm', color='town', title="Average Price Per Sqm over Time")
+            st.plotly_chart(fig_psm, use_container_width=True)
+        else:
+            st.warning("No data for selected period.")
             
     st.divider()
     st.markdown("#### 🗺️ Geographic Distribution")
@@ -293,6 +321,7 @@ if not df.empty:
         column_config={
             "month": st.column_config.DateColumn("Month"),
             "resale_price": st.column_config.NumberColumn("Price", format="$%d"),
+            "price_per_sqm": st.column_config.NumberColumn("Price/Sqm", format="$%.2f"), # NEW COLUMN
             "floor_area_sqm": st.column_config.NumberColumn("Size (sqm)")
         },
         height=400
@@ -304,10 +333,10 @@ if not df.empty:
     
     st.markdown("""
     **Try asking questions like:**
-    * 💰 *'What is the most expensive block in Ang Mo Kio?'* (Uses new context!)
-    * 🔎 *'What is the average price of Block 123 Bedok?'* (Uses Python code)
+    * 💰 *'What is the most expensive block in Ang Mo Kio?'*
+    * 📏 *'Which town has the highest price per square meter?'* (New!)
     * 📊 *'Compare price trends between Tampines and Pasir Ris'*
-    * 📅 *'Which month generally has the lowest transaction volume?'*
+    * 🏠 *'What is the average price/sqm for a 4-room flat in Bedok?'*
     """)
     
     if "messages" not in st.session_state:
@@ -316,7 +345,7 @@ if not df.empty:
     for msg in st.session_state.messages:
         st.chat_message(msg["role"]).write(msg["content"])
 
-    if prompt := st.chat_input("Ask about prices, blocks, or trends..."):
+    if prompt := st.chat_input("Ask about prices, trends, or PSM..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
         
