@@ -85,7 +85,6 @@ def load_all_data():
 
 # --- HELPER: CONTEXT GENERATOR ---
 def get_dataset_context(df):
-    """Summarizes recent data to help AI make text-based predictions."""
     latest_year = df['month'].dt.year.max()
     recent_df = df[df['month'].dt.year == latest_year]
     
@@ -120,32 +119,44 @@ def ask_ai(question, df):
     User Question: "{question}"
     
     STRICT RULES:
-    1. **FUTURE PREDICTIONS (e.g., "Price in 2026?"):** - Do NOT write Python code (data ends in 2025).
-       - Write a TEXT response estimating based on the [Overall Yearly Trend].
-       
-    2. **CURRENT/PAST FACTS (e.g., "Average price in 2024?"):**
+    1. **FUTURE PREDICTIONS** (e.g. "Price in 2026?"): Do NOT write code. Write TEXT estimate based on trend.
+    2. **ADVICE** (e.g. "Should I sell?"): Write TEXT only.
+    3. **CALCULATIONS** (e.g. "Most expensive town?", "Average price?"): 
        - Write Python code wrapped in ```python ... ```.
-       
-    3. **ADVICE (e.g., "Should I sell?"):**
-       - Write a text response based on trends. No code.
+       - IMPORTANT: Assign your final answer (as a string) to a variable named `result`.
+       - Example Code:
+         ```python
+         top_town = df.groupby('town')['resale_price'].mean().idxmax()
+         result = f"The most expensive town is {{top_town}}."
+         ```
     """
     
     try:
         response = model.generate_content(prompt)
         text = response.text.strip()
         
+        # Check for code block
         code_match = re.search(r"```python(.*?)```", text, re.DOTALL)
         if code_match:
             code = code_match.group(1).strip()
-            if "import" in code or "open(" in code: return "Safety Block.", None
-            local_vars = {"df": df, "pd": pd}
-            result = eval(code, {"__builtins__": None}, local_vars)
-            return result, code
+            
+            # Safety Block
+            if "import" in code or "open(" in code: 
+                return "I cannot execute that command for safety reasons.", None
+            
+            # EXECUTION (Updated to use exec() for multi-line support)
+            local_vars = {"df": df, "pd": pd, "result": None}
+            
+            try:
+                exec(code, {"__builtins__": None}, local_vars)
+                return local_vars.get("result", "Calculation finished but no result returned."), code
+            except Exception as e:
+                return f"Calculation Error: {e}", code
         else:
             return text, None
             
     except Exception as e:
-        return f"Error: {e}", None
+        return f"AI Error: {e}", None
 
 # --- MAIN APP UI ---
 st.title("🇸🇬 HDB AI Analyst")
@@ -159,7 +170,6 @@ if not df.empty:
     # --- SIDEBAR FILTERS ---
     st.sidebar.header("Filter Settings")
     
-    # 1. DATE FILTER (Restored!)
     min_date = df['month'].min().date()
     max_date = df['month'].max().date()
     start_date, end_date = st.sidebar.date_input(
@@ -169,20 +179,17 @@ if not df.empty:
         max_value=max_date
     )
 
-    # 2. TOWN FILTER
     all_towns = sorted(df['town'].astype(str).unique())
     sel_towns = st.sidebar.multiselect("Towns", all_towns, default=["ANG MO KIO", "BEDOK"])
     
-    # 3. TYPE FILTER
     all_types = sorted(df['flat_type'].astype(str).unique())
     default_types = ['4 ROOM'] if '4 ROOM' in all_types else [all_types[0]]
     sel_types = st.sidebar.multiselect("Flat Types", all_types, default=default_types)
     
-    # Default to 'All' if selection empty
     if not sel_towns: sel_towns = all_towns
     if not sel_types: sel_types = all_types
     
-    # --- APPLY FILTERS ---
+    # Apply Filters
     mask_date = (df['month'].dt.date >= start_date) & (df['month'].dt.date <= end_date)
     mask_town = df['town'].isin(sel_towns)
     mask_type = df['flat_type'].isin(sel_types)
@@ -197,23 +204,31 @@ if not df.empty:
         c2.metric("Avg Price", f"${filt_df['resale_price'].mean():,.0f}")
         c3.metric("Max Price", f"${filt_df['resale_price'].max():,.0f}")
     
-    tab1, tab2 = st.tabs(["📈 Trend", "🗺️ Map"])
-    with tab1:
-        if not filt_df.empty:
-            trend_data = filt_df.groupby(['month', 'town'])['resale_price'].mean().reset_index().sort_values('month')
-            fig = px.line(trend_data, x='month', y='resale_price', color='town')
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("No data for selected period.")
+    # --- CHART 1: TREND (TOP) ---
+    st.divider()
+    st.markdown("#### 📈 Price Trends")
+    if not filt_df.empty:
+        trend_data = filt_df.groupby(['month', 'town'])['resale_price'].mean().reset_index().sort_values('month')
+        fig = px.line(trend_data, x='month', y='resale_price', color='town')
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("No data for selected period.")
             
-    with tab2:
-        if not filt_df.empty:
-            stats = filt_df.groupby('town').agg(Count=('resale_price','count'), Avg=('resale_price','mean')).reset_index()
-            stats['lat'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lat'))
-            stats['lon'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lon'))
-            if not stats.dropna().empty:
-                fig = px.scatter_mapbox(stats.dropna(), lat="lat", lon="lon", size="Count", color="Avg", zoom=10, mapbox_style="carto-positron")
-                st.plotly_chart(fig, use_container_width=True)
+    # --- CHART 2: MAP (BOTTOM) ---
+    st.divider()
+    st.markdown("#### 🗺️ Geographic Distribution")
+    if not filt_df.empty:
+        stats = filt_df.groupby('town').agg(Count=('resale_price','count'), Avg=('resale_price','mean')).reset_index()
+        stats['lat'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lat'))
+        stats['lon'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lon'))
+        if not stats.dropna().empty:
+            fig_map = px.scatter_mapbox(
+                stats.dropna(), lat="lat", lon="lon", size="Count", color="Avg", 
+                zoom=10, mapbox_style="carto-positron", color_continuous_scale="Reds"
+            )
+            st.plotly_chart(fig_map, use_container_width=True)
+        else:
+            st.info("Map coordinates not available.")
 
     st.divider()
 
