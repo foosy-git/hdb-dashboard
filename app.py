@@ -6,7 +6,7 @@ import os
 import google.generativeai as genai
 import re
 
-st.set_page_config(page_title="HDB Resale Prices AI Analyst", layout="wide")
+st.set_page_config(page_title="HDB AI Analyst", layout="wide")
 
 # --- 1. SECURE API KEY ---
 try:
@@ -85,16 +85,30 @@ def load_all_data():
 
 # --- HELPER: CONTEXT GENERATOR ---
 def get_dataset_context(df):
-    latest_year = df['month'].dt.year.max()
-    recent_df = df[df['month'].dt.year == latest_year]
+    """Summarizes data (Price & Volume) for the AI."""
+    # 1. Setup Data
+    df_context = df.copy()
+    df_context['year'] = df_context['month'].dt.year
+    latest_year = df_context['year'].max()
     
+    # 2. Price Map (Recent)
+    recent_df = df_context[df_context['year'] == latest_year]
     price_map = recent_df.groupby(['town', 'flat_type'])['resale_price'].mean().to_dict()
-    df['year'] = df['month'].dt.year
-    yearly_trend = df.groupby('year')['resale_price'].mean().to_dict()
+    
+    # 3. Yearly Trends (Price AND Volume)
+    yearly_price = df_context.groupby('year')['resale_price'].mean().to_dict()
+    yearly_vol = df_context.groupby('year')['resale_price'].count().to_dict()
+    
+    # 4. Peak Volume Month
+    monthly_counts = df_context.groupby('month').size()
+    peak_month = monthly_counts.idxmax().strftime('%Y-%m')
+    peak_val = monthly_counts.max()
     
     return f"""
-    [Current Year ({latest_year}) Prices by Town/Type]: {price_map}
-    [Overall Yearly Trend]: {yearly_trend}
+    [Current Year ({latest_year}) Prices]: {price_map}
+    [Yearly Avg Price]: {yearly_price}
+    [Yearly Volume (Transactions)]: {yearly_vol}
+    [Highest Volume Month All-Time]: {peak_month} ({peak_val} sales)
     """
 
 # --- AI ENGINE ---
@@ -118,7 +132,7 @@ def ask_ai(question, df):
     STRICT RULES:
     1. **FUTURE PREDICTIONS** (e.g. "Price in 2026?"): Do NOT write code. Write TEXT estimate based on trend.
     2. **ADVICE** (e.g. "Should I sell?"): Write TEXT only.
-    3. **CALCULATIONS** (e.g. "Most expensive town?", "Average price?"): 
+    3. **CALCULATIONS** (e.g. "Most expensive town?", "Average price?", "Highest transactions?"): 
        - Write Python code wrapped in ```python ... ```.
        - IMPORTANT: Assign your final answer (as a string) to a variable named `result`.
        - Example:
@@ -132,6 +146,7 @@ def ask_ai(question, df):
         response = model.generate_content(prompt)
         text = response.text.strip()
         
+        # Check for code block
         code_match = re.search(r"```python(.*?)```", text, re.DOTALL)
         if code_match:
             code = code_match.group(1).strip()
@@ -139,10 +154,11 @@ def ask_ai(question, df):
             if "import" in code or "open(" in code: 
                 return "I cannot execute that command for safety reasons.", None
             
-            # Allow standard builtins by passing empty globals {}
+            # Execution Environment
             local_vars = {"df": df, "pd": pd, "result": None}
             
             try:
+                # Use standard globals (None) to allow len(), max(), etc.
                 exec(code, {}, local_vars)
                 return local_vars.get("result", "Calculation finished but no result returned."), code
             except Exception as e:
@@ -154,7 +170,7 @@ def ask_ai(question, df):
         return f"AI Error: {e}", None
 
 # --- MAIN APP UI ---
-st.title("🇸🇬 HDB Resale Prices AI Analyst")
+st.title("🇸🇬 HDB AI Analyst")
 
 df = load_all_data()
 if not df.empty and 'month' in df.columns:
@@ -165,6 +181,7 @@ if not df.empty:
     # --- SIDEBAR FILTERS ---
     st.sidebar.header("Filter Settings")
     
+    # 1. Date Filter
     min_date = df['month'].min().date()
     max_date = df['month'].max().date()
     start_date, end_date = st.sidebar.date_input(
@@ -174,103 +191,9 @@ if not df.empty:
         max_value=max_date
     )
 
+    # 2. Town Filter
     all_towns = sorted(df['town'].astype(str).unique())
     sel_towns = st.sidebar.multiselect("Towns", all_towns, default=["ANG MO KIO", "BEDOK"])
     
-    all_types = sorted(df['flat_type'].astype(str).unique())
-    default_types = ['4 ROOM'] if '4 ROOM' in all_types else [all_types[0]]
-    sel_types = st.sidebar.multiselect("Flat Types", all_types, default=default_types)
-    
-    if not sel_towns: sel_towns = all_towns
-    if not sel_types: sel_types = all_types
-    
-    # Apply Filters
-    mask_date = (df['month'].dt.date >= start_date) & (df['month'].dt.date <= end_date)
-    mask_town = df['town'].isin(sel_towns)
-    mask_type = df['flat_type'].isin(sel_types)
-    
-    filt_df = df[mask_date & mask_town & mask_type].copy()
-
-    # --- VISUAL DASHBOARD ---
-    st.subheader("📊 Visual Explorer")
-    c1, c2, c3 = st.columns(3)
-    if not filt_df.empty:
-        c1.metric("Volume", f"{len(filt_df):,}")
-        c2.metric("Avg Price", f"${filt_df['resale_price'].mean():,.0f}")
-        c3.metric("Max Price", f"${filt_df['resale_price'].max():,.0f}")
-    
-    # --- CHART 1: TREND (TOP) ---
-    st.divider()
-    st.markdown("#### 📈 Price Trends")
-    if not filt_df.empty:
-        trend_data = filt_df.groupby(['month', 'town'])['resale_price'].mean().reset_index().sort_values('month')
-        fig = px.line(trend_data, x='month', y='resale_price', color='town')
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("No data for selected period.")
-            
-    # --- CHART 2: MAP (BOTTOM) ---
-    st.divider()
-    st.markdown("#### 🗺️ Geographic Distribution")
-    if not filt_df.empty:
-        stats = filt_df.groupby('town').agg(Count=('resale_price','count'), Avg=('resale_price','mean')).reset_index()
-        stats['lat'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lat'))
-        stats['lon'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lon'))
-        if not stats.dropna().empty:
-            fig_map = px.scatter_mapbox(
-                stats.dropna(), lat="lat", lon="lon", size="Count", color="Avg", 
-                zoom=10, mapbox_style="carto-positron", color_continuous_scale="Reds"
-            )
-            st.plotly_chart(fig_map, use_container_width=True)
-        else:
-            st.info("Map coordinates not available.")
-
-    # --- DATA TABLE (RESTORED) ---
-    st.divider()
-    st.markdown("#### 📋 Detailed Data")
-    
-    # Search Filter
-    search_query = st.text_input("🔍 Search by Street Name or Block", "")
-    if search_query:
-        # Filter logic
-        display_df = filt_df[
-            filt_df['street_name'].astype(str).str.contains(search_query, case=False, na=False) | 
-            filt_df['block'].astype(str).str.contains(search_query, case=False, na=False)
-        ]
-    else:
-        display_df = filt_df
-
-    st.dataframe(
-        display_df.sort_values('month', ascending=False),
-        column_config={
-            "month": st.column_config.DateColumn("Month"),
-            "resale_price": st.column_config.NumberColumn("Price", format="$%d"),
-            "floor_area_sqm": st.column_config.NumberColumn("Size (sqm)")
-        },
-        height=400
-    )
-
-    st.divider()
-
-    # --- AI CHATBOT ---
-    st.subheader("🤖 AI Consultant")
-    
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    for msg in st.session_state.messages:
-        st.chat_message(msg["role"]).write(msg["content"])
-
-    if prompt := st.chat_input("Ask about prices, trends, or predictions..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        st.chat_message("user").write(prompt)
-        
-        with st.chat_message("assistant"):
-            with st.spinner("Analyzing..."):
-                answer, code = ask_ai(prompt, df)
-                st.write(answer)
-                if code:
-                    with st.expander("View Code"):
-                        st.code(code)
-        
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+    # 3. Type Filter
+    all_types = sorted
