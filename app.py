@@ -57,7 +57,7 @@ def ask_ai(question, df):
         return "⚠️ API Key missing. Please set GEMINI_API_KEY in secrets.", None
     
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-2.5-flash')
     
     columns = list(df.columns)
     sample_data = df.head(3).to_string()
@@ -152,4 +152,24 @@ if not df.empty:
         sel_towns = st.multiselect("Towns", towns, default=["ANG MO KIO", "BEDOK"])
     with c2:
         types = sorted(df['flat_type'].astype(str).unique())
-        sel_types = st.mult
+        sel_types = st.multiselect("Types", types, default=['4 ROOM'])
+    
+    if sel_towns and sel_types:
+        mask = df['town'].isin(sel_towns) & df['flat_type'].isin(sel_types)
+        filt_df = df[mask]
+        
+        # Map
+        stats = filt_df.groupby('town').agg(
+            Count=('resale_price', 'count'), Avg=('resale_price', 'mean')
+        ).reset_index()
+        stats['lat'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lat'))
+        stats['lon'] = stats['town'].map(lambda x: TOWN_COORDS.get(x, {}).get('lon'))
+        
+        if not stats.dropna().empty:
+            fig = px.scatter_mapbox(
+                stats.dropna(), lat="lat", lon="lon", size="Count", color="Avg",
+                color_continuous_scale="Reds", zoom=10, mapbox_style="carto-positron"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+        st.dataframe(filt_df.sort_values('month', ascending=False).head(100))
