@@ -4,16 +4,15 @@ import requests
 import plotly.express as px
 import os
 import google.generativeai as genai
+import re
 
 st.set_page_config(page_title="HDB AI Analyst", layout="wide")
 
-# --- 1. SECURE API KEY HANDLING ---
-# Try to get the key from Streamlit Secrets
+# --- 1. SECURE API KEY ---
 try:
     if "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
     else:
-        # Fallback for local testing if secrets.toml is missing (Not recommended for prod)
         api_key = os.getenv("GEMINI_API_KEY") 
 except FileNotFoundError:
     api_key = None
@@ -51,37 +50,64 @@ TOWN_COORDS = {
     "YISHUN": {"lat": 1.4304, "lon": 103.8354}
 }
 
-# --- AI ENGINE ---
+# --- HYBRID AI ENGINE (Code + Text) ---
 def ask_ai(question, df):
     if not api_key:
-        return "⚠️ API Key missing. Please set GEMINI_API_KEY in secrets.", None
+        return "⚠️ API Key missing. Please check your secrets.", None
     
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel('gemini-2.5-flash')
     
+    # 1. Create Data Context (The "Cheat Sheet" for the AI)
+    # This gives the AI a summary of the data so it can answer qualitative questions.
     columns = list(df.columns)
-    sample_data = df.head(3).to_string()
+    data_summary = df.describe().to_string()
     
+    # 2. Advanced Prompt
     prompt = f"""
-    You are a Python Data Analyst. 
-    You have a pandas dataframe named 'df'.
+    You are a Singapore Housing Data Expert. You have a pandas dataframe 'df'.
+    
+    --- METADATA ---
     Columns: {columns}
-    Sample: {sample_data}
+    Data Summary (Stats): 
+    {data_summary}
+    ----------------
     
-    User Query: "{question}"
+    User Question: "{question}"
     
-    Task: Write 1 line of Python code to answer. Return ONLY the code. No markdown.
-    Example: df[df['town']=='BEDOK']['resale_price'].mean()
+    INSTRUCTIONS:
+    1. If the user asks for a specific NUMBER or FACT (e.g., "Average price", "Highest sale"), 
+       write a Python code snippet wrapped in ```python ... ``` tags to calculate it.
+       The code must return a formatted string (e.g., f"The average is ${{...}}").
+       
+    2. If the user asks an OPEN-ENDED or ANALYSIS question (e.g., "Explain the price trends", "What data is this?", "Why is Bishan expensive?"), 
+       write a normal text response based on the 'Data Summary' above. DO NOT write code.
+    
+    3. Keep answers concise and professional.
     """
     
     try:
         response = model.generate_content(prompt)
-        generated_code = response.text.strip().replace("```python", "").replace("```", "")
-        local_vars = {"df": df, "pd": pd}
-        result = eval(generated_code, {"__builtins__": None}, local_vars)
-        return result, generated_code
+        text_response = response.text.strip()
+        
+        # 3. Detect if the AI wrote code or text
+        # We look for the ```python pattern
+        code_match = re.search(r"```python(.*?)```", text_response, re.DOTALL)
+        
+        if code_match:
+            # OPTION A: AI provided Code -> Execute it
+            generated_code = code_match.group(1).strip()
+            local_vars = {"df": df, "pd": pd}
+            
+            # Run the code safely
+            result = eval(generated_code, {"__builtins__": None}, local_vars)
+            return result, generated_code
+        else:
+            # OPTION B: AI provided Text -> Return it directly
+            return text_response, None
+            
     except Exception as e:
-        return f"Could not calculate. ({e})", None
+        return f"I couldn't answer that. (Error: {e})", None
 
 # --- DATA LOADER ---
 @st.cache_data(ttl=3600)
@@ -89,7 +115,7 @@ def load_all_data():
     if os.path.exists(CACHE_FILE):
         return pd.read_csv(CACHE_FILE)
 
-    base_url = "https://data.gov.sg/api/action/datastore_search"
+    base_url = "[https://data.gov.sg/api/action/datastore_search](https://data.gov.sg/api/action/datastore_search)"
     all_records = []
     offset = 0
     limit = 10000 
@@ -120,7 +146,7 @@ def load_all_data():
     except Exception: return pd.DataFrame()
 
 # --- UI LAYOUT ---
-st.title("🇸🇬 HDB AI Analyst")
+st.title("🇸🇬 HDB AI Analyst (Open-Ended)")
 df = load_all_data()
 
 if not df.empty and 'month' in df.columns:
@@ -128,19 +154,40 @@ if not df.empty and 'month' in df.columns:
 
 if not df.empty:
     # --- AI CHATBOT ---
-    st.markdown("### 🤖 Ask the AI")
+    st.markdown("### 🤖 Ask Anything")
+    st.caption("Try: *'What is the trend?', 'Analyze the prices in Bedok', 'Highest price 4-room flat?'*")
     
     if not api_key:
-        st.warning("🔴 **Developer Note:** API Key is not configured. Please add `GEMINI_API_KEY` to your secrets.")
+        st.warning("API Key not found. Please add `GEMINI_API_KEY` to your secrets.")
     else:
-        question = st.text_input("Ask a question:", placeholder="e.g., 'What is the highest price in Bishan?'")
-        if question:
-            with st.spinner("Thinking..."):
-                answer, code = ask_ai(question, df)
-                st.success(f"**Answer:** {answer}")
-                if code:
-                    with st.expander("Show Logic"):
-                        st.code(code, language="python")
+        # Chat History container
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+
+        # Display previous chat
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        # Chat Input
+        if prompt := st.chat_input("Ask about HDB trends, facts, or analysis..."):
+            # Add user message to history
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            # Generate response
+            with st.chat_message("assistant"):
+                with st.spinner("Analyzing..."):
+                    answer, code = ask_ai(prompt, df)
+                    st.markdown(answer)
+                    
+                    if code:
+                        with st.expander("View Calculation Code"):
+                            st.code(code, language="python")
+                            
+            # Add assistant message to history
+            st.session_state.messages.append({"role": "assistant", "content": answer})
 
     st.divider()
 
@@ -152,7 +199,8 @@ if not df.empty:
         sel_towns = st.multiselect("Towns", towns, default=["ANG MO KIO", "BEDOK"])
     with c2:
         types = sorted(df['flat_type'].astype(str).unique())
-        sel_types = st.multiselect("Types", types, default=['4 ROOM'])
+        default_opts = ['4 ROOM'] if '4 ROOM' in types else [types[0]]
+        sel_types = st.multiselect("Types", types, default=default_opts)
     
     if sel_towns and sel_types:
         mask = df['town'].isin(sel_towns) & df['flat_type'].isin(sel_types)
