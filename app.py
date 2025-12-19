@@ -51,28 +51,26 @@ TOWN_COORDS = {
     "YISHUN": {"lat": 1.4304, "lon": 103.8354}
 }
 
-# --- SAFE DATA LOADER (UPDATED TIMEOUT) ---
+# --- SAFE DATA LOADER ---
 @st.cache_data(ttl=3600)
 def load_all_data():
-    # 1. Try loading local cache first
     if os.path.exists(CACHE_FILE):
         try:
             return pd.read_csv(CACHE_FILE)
         except:
-            pass # If file is corrupt, download again
+            pass 
 
     base_url = "https://data.gov.sg/api/action/datastore_search"
     all_records = []
     offset = 0
     limit = 10000 
     
-    # 2. Visual Progress Indicators
     status_text = st.empty()
     progress_bar = st.progress(0)
     
     try:
         while True:
-            # INCREASED TIMEOUT TO 60 SECONDS
+            # 60 Second Timeout for slow connections
             params = {"resource_id": RESOURCE_ID, "limit": limit, "offset": offset, "sort": "month desc"}
             r = requests.get(base_url, params=params, timeout=60) 
             data = r.json()
@@ -82,27 +80,22 @@ def load_all_data():
             new_records = data['result']['records']
             all_records.extend(new_records)
             
-            # Update User Interface
             status_text.text(f"⏳ Downloading HDB Data... {len(all_records):,} rows collected")
             
             if len(new_records) < limit: break
             offset += limit
-            
             if len(all_records) > 300000: break
 
-        # 3. Cleanup UI
         progress_bar.empty()
         status_text.empty()
         
         df = pd.DataFrame(all_records)
         
-        # 4. Data Cleaning
         if 'month' in df.columns: df['month'] = pd.to_datetime(df['month'])
         cols_to_numeric = ['resale_price', 'floor_area_sqm', 'lease_commence_date']
         for c in cols_to_numeric:
             if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
             
-        # Save to cache
         df.to_csv(CACHE_FILE, index=False)
         return df
 
@@ -110,13 +103,14 @@ def load_all_data():
         st.error(f"Data Download Failed: {e}")
         return pd.DataFrame()
 
-# --- HELPER: CONTEXT GENERATOR ---
+# --- HELPER: CONTEXT GENERATOR (UPDATED WITH BLOCK ANALYSIS) ---
 def get_dataset_context(df):
-    """Summarizes data (Price, Volume, Seasonality, History) for the AI."""
+    """Summarizes data (Price, Volume, Seasonality, Block Highlights) for the AI."""
     df_context = df.copy()
     df_context['year'] = df_context['month'].dt.year
     latest_year = df_context['year'].max()
     
+    # 1. Standard Summaries
     recent_df = df_context[df_context['year'] == latest_year]
     current_price_map = recent_df.groupby(['town', 'flat_type'])['resale_price'].mean().to_dict()
     yearly_price = df_context.groupby('year')['resale_price'].mean().to_dict()
@@ -126,13 +120,27 @@ def get_dataset_context(df):
     total_years = df_context['year'].nunique()
     seasonality = (df_context.groupby('month_name').size() / total_years).astype(int).to_dict()
     
+    # 2. Historical Town/Type Map
     historical_map = df_context.groupby(['year', 'town', 'flat_type'])['resale_price'].mean().to_dict()
+    
+    # 3. NEW: Block Highlights (Top 1 Most Expensive Block per Town)
+    # We aggregate by block to find the "Premium Blocks" in each area
+    block_df = df_context.groupby(['town', 'block'])['resale_price'].mean().reset_index()
+    # Sort by Town (Asc) and Price (Desc)
+    top_blocks = block_df.sort_values(['town', 'resale_price'], ascending=[True, False]).drop_duplicates('town')
+    
+    # Create a readable string map: {'ANG MO KIO': 'Block 310A ($1,200,000)', ...}
+    top_block_map = {
+        row['town']: f"Block {row['block']} (Avg ${row['resale_price']:,.0f})"
+        for _, row in top_blocks.iterrows()
+    }
     
     return f"""
     (Reference: Current Year Prices): {current_price_map}
     (Reference: Global Yearly Trends): {yearly_price}
     (Reference: Seasonality): {seasonality}
     (Reference: Detailed History): {historical_map}
+    (Reference: Most Expensive Block in Each Town): {top_block_map}
     """
 
 # --- AI ENGINE ---
@@ -156,18 +164,20 @@ def ask_ai(question, df):
     STRICT RULES:
     1. **FUTURE PREDICTIONS** (e.g. "Price in 2026?"): Do NOT write code. Write TEXT estimate based on trend references.
     
-    2. **ADVICE/ANALYSIS** (e.g. "Lowest month?", "Compare 2019 vs 2024"): 
+    2. **ADVICE/ANALYSIS** (e.g. "Lowest month?", "Best block in Bedok?"): 
        - Read the (Reference) data above.
-       - Write a TEXT response explaining the data.
+       - You can mention the "Most Expensive Block" from the reference list.
+       - Write a TEXT response.
     
-    3. **CALCULATIONS** (e.g. "Most expensive town?", "Average price in 2019?"): 
+    3. **CALCULATIONS** (e.g. "Average price of Block 123?", "Count transactions in 2024?"): 
        - You MUST write Python code using the dataframe `df`.
-       - **CRITICAL:** Do NOT try to use variables like `historical_map` or `price_map` in your Python code. They do not exist in the code environment. You must query `df` directly.
+       - The dataframe contains columns: `town`, `block`, `street_name`, `flat_type`, `resale_price`, `month`.
+       - **CRITICAL:** Do NOT try to use variables like `top_block_map` in your Python code. Query `df` directly.
        - Example:
          ```python
-         # Correct way to find max price in 2019
-         res = df[df['month'].dt.year == 2019].groupby('town')['resale_price'].mean().idxmax()
-         result = f"The most expensive town in 2019 was {{res}}."
+         # Correct way to query a specific block
+         avg = df[(df['town']=='BEDOK') & (df['block']=='123')]['resale_price'].mean()
+         result = f"The average price at Block 123 Bedok is ${{avg:,.0f}}."
          ```
        - Assign your final string answer to variable `result`.
     """
@@ -176,6 +186,7 @@ def ask_ai(question, df):
         response = model.generate_content(prompt)
         text = response.text.strip()
         
+        # Check for code block
         code_match = re.search(r"```python(.*?)```", text, re.DOTALL)
         if code_match:
             code = code_match.group(1).strip()
@@ -293,11 +304,10 @@ if not df.empty:
     
     st.markdown("""
     **Try asking questions like:**
-    * 💰 *'What is the average price of a 4-room flat in Bedok?'*
-    * 🔎 *'Find towns with 4-room flats under $500k'*
+    * 💰 *'What is the most expensive block in Ang Mo Kio?'* (Uses new context!)
+    * 🔎 *'What is the average price of Block 123 Bedok?'* (Uses Python code)
     * 📊 *'Compare price trends between Tampines and Pasir Ris'*
     * 📅 *'Which month generally has the lowest transaction volume?'*
-    * 🏠 *'What is the most expensive flat sold in 2024?'*
     """)
     
     if "messages" not in st.session_state:
@@ -306,7 +316,7 @@ if not df.empty:
     for msg in st.session_state.messages:
         st.chat_message(msg["role"]).write(msg["content"])
 
-    if prompt := st.chat_input("Ask about prices, transactions, or trends..."):
+    if prompt := st.chat_input("Ask about prices, blocks, or trends..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
         
