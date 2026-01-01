@@ -20,7 +20,7 @@ except FileNotFoundError:
 
 # --- CONFIGURATION ---
 # Note: Using the RAW version of your GitHub URL
-GITHUB_CSV_URL = "https://raw.githubusercontent.com/foosy-git/hdb-dashboard/main/2017-2025.csv"
+GITHUB_CSV_URL = "https://raw.githubusercontent.com/foosy-git/hdb-dashboard/main/1990-2025.csv"
 RESOURCE_ID = "d_8b84c4ee58e3cfc0ece0d773c8ca6abc"
 CACHE_FILE = "hdb_combined_cache.csv"
 
